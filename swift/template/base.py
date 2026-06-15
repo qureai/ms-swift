@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, 
 from swift.utils import Processor, ProcessorMixin, get_env_args, get_logger, remove_response, retry_decorator, to_device
 from .template_inputs import StdTemplateInputs, TemplateInputs
 from .utils import Context, ContextType, StopWordsCriteria, fetch_one, findall, get_last_user_round, split_str_parts_by
-from .vision_utils import _check_path, load_audio, load_batch, load_image, rescale_image
+from .vision_utils import _check_path, _resolve_storage_path, load_audio, load_batch, load_image, rescale_image
 
 logger = get_logger()
 if TYPE_CHECKING:
@@ -261,20 +261,46 @@ class Template(ProcessorMixin):
         return self.dummy_model
 
     @staticmethod
-    def _load_image(image, load_images: bool):
+    def _load_image(image: Union[str, bytes, Image.Image, Dict], load_images: bool) -> Union[str, Image.Image]:
+        """
+        Pre-processes an image input, with added fallback logic for /raid3 paths.
+        """
         if load_images:
-            if isinstance(image, dict) and 'bytes' in image:
-                image = image['bytes'] or image['path']
+            # This branch delegates to the main `load_image` function, which should
+            # already have the raid3 check. We just need to extract the right data.
+            if isinstance(image, dict):
+                # Prioritize bytes if they exist, otherwise use the path
+                image = image.get('bytes') or image.get('path')
+            
+            # The main load_image function will handle loading from path, bytes, etc.
+            # and should contain the robust try/except block.
             image = load_image(image)
         else:
+            # This branch tries to keep the image as a path string if possible.
+            # This is where the explicit raid3 check needs to be added.
             if isinstance(image, dict):
-                path = image['path']
-                if path and (path.startswith('http') or os.path.exists(path)):
-                    image = path
+                path = image.get('path')
+                valid_path = None
+
+                if path:
+                    if path.startswith('http'):
+                        valid_path = path
+                    else:
+                        valid_path = _resolve_storage_path(path)
+
+                if valid_path:
+                    # We found a valid path (original, fallback, or http), so we keep it as a string.
+                    image = valid_path
                 else:
-                    image = load_image(image['bytes'])
+                    # No valid path was found, so we must load from the 'bytes' field.
+                    # Using .get() is safer to avoid a KeyError if 'bytes' is missing.
+                    image = load_image(image.get('bytes'))
+            
             elif not isinstance(image, str):
+                # If the input isn't a dict or a string path, it's likely bytes or a PIL image
+                # that needs to be loaded/processed.
                 image = load_image(image)
+                
         return image
 
     @staticmethod

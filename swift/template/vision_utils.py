@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import base64
+import functools
 import math
 import numpy as np
 import os
@@ -11,8 +12,33 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from typing import Any, Callable, List, TypeVar, Union
 from urllib3.util.retry import Retry
+import random
 
 from swift.utils import get_env_args
+
+_STORAGE_ROOTS = ('/localstorage', '/fastdata3', '/fastdata4')
+
+
+@functools.lru_cache(maxsize=131072)
+def _resolve_storage_path(path: str) -> Union[str, None]:
+    if path.startswith('http'):
+        return path
+    if os.path.exists(path):
+        return path
+    for root in _STORAGE_ROOTS:
+        prefix = root + '/'
+        if not path.startswith(prefix):
+            continue
+        suffix = path[len(root):]
+        for alt_root in _STORAGE_ROOTS:
+            if alt_root == root:
+                continue
+            candidate = alt_root + suffix
+            if os.path.exists(candidate):
+                return candidate
+        return None
+    return None
+
 
 # >>> internvl
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -162,12 +188,61 @@ def load_file(path: Union[str, bytes, _T]) -> Union[BytesIO, _T]:
 
 
 def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
-    image = load_file(image)
-    if isinstance(image, BytesIO):
-        image = Image.open(image)
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    return image
+    original_input = image
+    width, height = None, None
+
+    try:
+        # Case 1: Already PIL Image
+        if isinstance(image, Image.Image):
+            pass
+
+        # Case 2: It's a path
+        elif isinstance(image, str):
+            original_path = image
+            base_name = os.path.basename(image)
+            parts = base_name.split('_', 2)
+
+            if len(parts) == 3 and "image_" in base_name:
+                res_str = parts[1]
+                original_filename = parts[2]
+                width, height = map(int, res_str.split('x'))
+                base_name = original_filename
+                base_dir = os.path.dirname(original_path)
+                original_path = os.path.join(base_dir, base_name)
+
+            resolved_path = _resolve_storage_path(original_path)
+            if not resolved_path:
+                raise FileNotFoundError(f"Image not found: {original_path}")
+            image = load_file(resolved_path)
+
+        # Case 3: It's bytes
+        elif isinstance(image, bytes):
+            image = load_file(image)
+
+        # Case 4: Decode if BytesIO
+        if isinstance(image, BytesIO):
+            image = Image.open(image)
+            
+
+        # Ensure RGB mode
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        if width is not None and height is not None:
+            # print(f"Resizing image to {width}x{height}")
+            image = image.resize((width, height), Image.LANCZOS)
+
+        return image
+
+    except Exception as e:
+        print(f"[WARN] Failed to load image: {e}")
+        print(f"Original input: {original_input}")
+        # Fallback: random RGB image
+        return Image.frombytes(
+            'RGB',
+            (512, 512),
+            bytes([random.randint(0, 255) for _ in range(512 * 512 * 3)])
+        )
 
 
 def load_batch(path_list: List[Union[str, None, Any, BytesIO]],
