@@ -96,6 +96,13 @@ class Template(ProcessorMixin):
         enable_thinking: Optional[bool] = None,
         preserve_thinking: Optional[bool] = None,
         add_non_thinking_prefix: bool = True,
+        # CT volume (3D encoder) options; inert for non-CT templates
+        ct_windows: Optional[List[str]] = None,
+        ct_window_base: str = 'full_range',
+        ct_volume_size: Optional[str] = None,
+        ct_augment: bool = False,
+        ct_augment_prob: float = 0.15,
+        vision_3d_max_tokens: Optional[int] = None,
     ) -> None:
         """
         default_system: Override the default_system in the template.
@@ -128,6 +135,13 @@ class Template(ProcessorMixin):
         self.enable_thinking = enable_thinking
         self.preserve_thinking = preserve_thinking
         self.add_non_thinking_prefix = add_non_thinking_prefix
+        # CT volume (3D encoder) options; only consumed by CT/volume templates
+        self.ct_windows = ct_windows or []
+        self.ct_window_base = ct_window_base
+        self.ct_volume_size = ct_volume_size
+        self.ct_augment = ct_augment
+        self.ct_augment_prob = ct_augment_prob
+        self.vision_3d_max_tokens = vision_3d_max_tokens
         self.chat_template_kwargs = {}
         self.remove_unused_columns = remove_unused_columns
         self.template_backend = template_backend

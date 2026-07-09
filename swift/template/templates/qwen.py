@@ -21,6 +21,7 @@ from ..utils import Context, Word, findall
 from ..vision_utils import load_audio, load_batch, load_video_ovis2, load_video_ovis2_5
 from .llama import Llama3TemplateMeta
 from .utils import DEFAULT_SYSTEM, ChatmlTemplateMeta
+from .volume_mixin import Volume3DTemplateMixin
 
 
 @dataclass
@@ -1373,3 +1374,162 @@ register_template(Qwen3MixedTemplateMeta(
     LLMTemplateType.yufeng_xguard,
     prompt=[YUFENG_XGUARD_TEMPLATE],
 ))
+
+
+class Qwen2_5_VL_CT_Template(Volume3DTemplateMixin, Qwen2_5VLTemplate):
+    """Qwen2.5-VL + CT volumes.
+
+    Images use Qwen's built-in 2D vision tower; `<video>` inputs pointing at CT volumes are loaded as
+    `(T, C, H, W)` tensors and routed to `model.visual_3d`. Each volume expands to
+    `vision_3d_max_tokens` `<video>` placeholder tokens, and a synthetic `video_grid_thw` is supplied
+    so Qwen's rope/position-id machinery assigns exactly that many positions.
+    """
+
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+                    inputs: StdTemplateInputs) -> List[Context]:
+        # Intercept CT-volume videos before Qwen's fetch_video; keep the path for _encode to load.
+        if media_type == 'video' and self.is_volume_path(inputs.videos[index]):
+            return ['<|vision_start|><|video_pad|><|vision_end|>']
+        return super().replace_tag(media_type, index, inputs)
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        # Reimplement the media loop (Photon-style) so volumes bypass Qwen's video processor.
+        encoded = Template._encode(self, inputs)
+        processor = self.processor
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
+        loss_scale = encoded.get('loss_scale', None)
+        mm_mask = [False] * len(input_ids)
+        merge_length = processor.image_processor.merge_size**2
+
+        # Images: standard Qwen 2D path.
+        if inputs.images:
+            media_inputs = processor.image_processor(images=inputs.images, return_tensors='pt', do_resize=False)
+            image_grid_thw = media_inputs['image_grid_thw']
+            idx_list = findall(input_ids, self.image_token_id)
+
+            def _image_tokens(i):
+                return [self.image_token_id] * (image_grid_thw[i].prod() // merge_length)
+
+            input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _image_tokens, mm_mask=mm_mask)
+            encoded.update(media_inputs)
+
+        # Videos: treated as CT volumes -> routed to the 3D encoder.
+        if inputs.videos:
+            non_volume = [v for v in inputs.videos if not self.is_volume_path(v)]
+            if non_volume:
+                raise ValueError(f'{self.__class__.__name__} expects CT-volume <video> inputs (one of '
+                                 f'{self.volume_extensions}); got non-volume video(s): {non_volume}.')
+            n_tokens = self.num_volume_tokens()
+            volumes = [self.load_volume(v) for v in inputs.videos]  # each (T, C, H, W), same size
+            pixel_values_volumes = torch.stack(volumes, dim=0)  # (n_vol, T, C, H, W)
+            # synthetic grid so rope assigns exactly n_tokens merged positions: prod([1,2,2N])//merge == N
+            video_grid_thw = torch.tensor([[1, 2, 2 * n_tokens]] * len(volumes), dtype=torch.long)
+            idx_list = findall(input_ids, self.video_token_id)
+
+            def _volume_tokens(i):
+                return [self.video_token_id] * n_tokens
+
+            input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _volume_tokens, mm_mask=mm_mask)
+            encoded['pixel_values_volumes'] = pixel_values_volumes
+            encoded['video_grid_thw'] = video_grid_thw
+            if self.version == 'v2_5':
+                encoded['second_per_grid_ts'] = [1.0] * len(volumes)
+
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
+        encoded['loss_scale'] = loss_scale
+        if self.requires_mm_token_type_ids and any(mm_mask):
+            encoded['mm_token_type_ids'] = self.create_mm_token_type_ids(input_ids, mm_mask)
+        return encoded
+
+
+register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_5_vl_ct, template_cls=Qwen2_5_VL_CT_Template))
+
+
+class Qwen3_VL_CT_Template(Volume3DTemplateMixin, Qwen3VLTemplate):
+    """Qwen3-VL + CT volumes.
+
+    Qwen3-VL merges 2D image features (with deepstack) inside the HF model, so we do NOT splice images
+    in the template. Instead `_post_encode` embeds the tokens, splices only the CT-volume features
+    (from `model.visual_3d`) into the `<video>` positions, and passes `pixel_values`/`image_grid_thw`
+    through — so the model still performs its native image merge over our `inputs_embeds`.
+    """
+
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+                    inputs: StdTemplateInputs) -> List[Context]:
+        if media_type == 'video' and self.is_volume_path(inputs.videos[index]):
+            return ['<|vision_start|><|video_pad|><|vision_end|>']
+        return super().replace_tag(media_type, index, inputs)
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        encoded = Template._encode(self, inputs)
+        processor = self.processor
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
+        loss_scale = encoded.get('loss_scale', None)
+        mm_mask = [False] * len(input_ids)
+        merge_length = processor.image_processor.merge_size**2
+
+        # Images: Qwen3-VL's native image path (features merged later by the HF model).
+        if inputs.images:
+            media_inputs = processor.image_processor(images=inputs.images, return_tensors='pt', do_resize=False)
+            image_grid_thw = media_inputs['image_grid_thw']
+            idx_list = findall(input_ids, self.image_token_id)
+
+            def _image_tokens(i):
+                return [self.image_token_id] * (image_grid_thw[i].prod() // merge_length)
+
+            input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _image_tokens, mm_mask=mm_mask)
+            encoded.update(media_inputs)
+
+        # Videos: treated as CT volumes -> routed to model.visual_3d.
+        if inputs.videos:
+            non_volume = [v for v in inputs.videos if not self.is_volume_path(v)]
+            if non_volume:
+                raise ValueError(f'{self.__class__.__name__} expects CT-volume <video> inputs (one of '
+                                 f'{self.volume_extensions}); got non-volume video(s): {non_volume}.')
+            n_tokens = self.num_volume_tokens()
+            volumes = [self.load_volume(v) for v in inputs.videos]
+            pixel_values_volumes = torch.stack(volumes, dim=0)  # (n_vol, T, C, H, W)
+            video_grid_thw = torch.tensor([[1, 2, 2 * n_tokens]] * len(volumes), dtype=torch.long)
+            idx_list = findall(input_ids, self.video_token_id)
+
+            def _volume_tokens(i):
+                return [self.video_token_id] * n_tokens
+
+            input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _volume_tokens, mm_mask=mm_mask)
+            encoded['pixel_values_volumes'] = pixel_values_volumes
+            encoded['video_grid_thw'] = video_grid_thw
+
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
+        encoded['loss_scale'] = loss_scale
+        if self.requires_mm_token_type_ids and any(mm_mask):
+            encoded['mm_token_type_ids'] = self.create_mm_token_type_ids(input_ids, mm_mask)
+        return encoded
+
+    def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.is_training:
+            return inputs
+        self._debug_start(model, inputs)
+        input_ids = inputs['input_ids']
+        base_model = self.get_base_model(model)
+        if hasattr(base_model.model, 'embed_tokens'):
+            inputs_embeds = base_model.model.embed_tokens(input_ids)
+        else:
+            inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
+        # 3D volumes only; the HF model merges 2D images (+ deepstack) itself from pixel_values.
+        inputs_embeds = self._splice_volume_embeds(inputs_embeds, inputs, model)
+        out = {'inputs_embeds': inputs_embeds}
+        for key in ('pixel_values', 'image_grid_thw'):
+            if inputs.get(key) is not None:
+                out[key] = inputs[key]
+        return out
+
+
+register_template(QwenTemplateMeta(MLLMTemplateType.qwen3_vl_ct, template_cls=Qwen3_VL_CT_Template))

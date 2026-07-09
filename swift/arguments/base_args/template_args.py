@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from swift.template import TEMPLATE_MAPPING, get_template_meta
 from swift.utils import get_logger
@@ -138,6 +138,18 @@ class TemplateArguments:
     enable_thinking: Optional[bool] = None
     preserve_thinking: Optional[bool] = None
     add_non_thinking_prefix: bool = True
+    # ===== CT volume (3D encoder) data options =====
+    # ct_windows: extra anatomical HU windows to add as channels (e.g. ['lung', 'mediastinum', 'bone']).
+    # ct_window_base: base channel prepended to ct_windows ('full_range' == [-1000, 1000], 'minmax', or 'none').
+    # ct_volume_size: 'D,H,W' resize target for CT volumes; None -> CT template default.
+    # The resulting channel count (== len(base) + len(ct_windows)) must equal the 3D encoder's in_channels;
+    # it is exposed as `ct_num_channels` for the encoder-attachment step.
+    ct_windows: List[str] = field(default_factory=list)
+    ct_window_base: Literal['full_range', 'minmax', 'none'] = 'full_range'
+    ct_volume_size: Optional[str] = None
+    # Photon-style probabilistic volume augmentation (training only).
+    ct_augment: bool = False
+    ct_augment_prob: float = 0.15
 
     def __post_init__(self):
         if getattr(self, 'model_meta', None) is not None:
@@ -156,6 +168,9 @@ class TemplateArguments:
             self.response_prefix = self.response_prefix.replace('\\n', '\n')
         if self.truncation_strategy is None:
             self.truncation_strategy = 'delete'
+        # number of CT windowing channels; the 3D encoder's in_channels is set to match this.
+        from swift.utils.ct_windowing import num_ct_channels
+        self.ct_num_channels = num_ct_channels(self.ct_windows, self.ct_window_base)
 
     def get_template_kwargs(self):
         truncation_strategy = self.truncation_strategy
@@ -183,4 +198,12 @@ class TemplateArguments:
             'enable_thinking': self.enable_thinking,
             'preserve_thinking': self.preserve_thinking,
             'add_non_thinking_prefix': self.add_non_thinking_prefix,
+            # CT volume (3D encoder) data options
+            'ct_windows': self.ct_windows,
+            'ct_window_base': self.ct_window_base,
+            'ct_volume_size': self.ct_volume_size,
+            'ct_augment': self.ct_augment,
+            'ct_augment_prob': self.ct_augment_prob,
+            # from ModelArguments (present on BaseArguments); how many tokens each CT volume expands to
+            'vision_3d_max_tokens': getattr(self, 'vision_3d_max_tokens', None),
         }

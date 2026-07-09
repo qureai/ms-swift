@@ -77,6 +77,13 @@ def get_template(
     enable_thinking: Optional[bool] = None,
     preserve_thinking: Optional[bool] = None,
     add_non_thinking_prefix: bool = True,
+    # CT volume (3D encoder) options; inert for non-CT templates
+    ct_windows: Optional[list] = None,
+    ct_window_base: str = 'full_range',
+    ct_volume_size: Optional[str] = None,
+    ct_augment: bool = False,
+    ct_augment_prob: float = 0.15,
+    vision_3d_max_tokens: Optional[int] = None,
 ) -> 'Template':
     """Get or create a template instance for model input/output formatting.
 
@@ -212,4 +219,10 @@ def get_template(
         enable_thinking=enable_thinking,
         preserve_thinking=preserve_thinking,
         add_non_thinking_prefix=add_non_thinking_prefix,
+        ct_windows=ct_windows,
+        ct_window_base=ct_window_base,
+        ct_volume_size=ct_volume_size,
+        ct_augment=ct_augment,
+        ct_augment_prob=ct_augment_prob,
+        vision_3d_max_tokens=vision_3d_max_tokens,
     )

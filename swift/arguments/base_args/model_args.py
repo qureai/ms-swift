@@ -92,6 +92,24 @@ class ModelArguments:
     init_strategy: Literal['zero', 'uniform', 'normal', 'xavier_uniform', 'xavier_normal', 'kaiming_uniform',
                            'kaiming_normal', 'orthogonal'] = None
 
+    # ===== Optional secondary 3D vision encoder (for CT volumes) =====
+    # vision_3d_model: model id/path whose vision encoder is used as a 3D backbone for CT volumes.
+    #   It may be a full VLM (only its vision tower is extracted) or a dedicated 3D encoder (e.g. Pillar0/Atlas).
+    #   Defaults to None -> no 3D encoder is loaded and behaviour is identical to upstream ms-swift.
+    # vision_3d_trust_remote_code: pass trust_remote_code=True when loading the 3D encoder (needed for custom-code
+    #   models such as YalaLab/Pillar0-ChestCT).
+    # vision_3d_module_path: explicit dotted attribute path to the vision tower submodule inside the loaded model
+    #   (overrides the architecture registry / class-name heuristic). E.g. 'visual' or 'model.vision_model'.
+    # vision_3d_inflate_weights: when an extracted tower has a 2D Conv patch-embed, replace it with a 3D Conv and
+    #   inflate the pretrained 2D weights across the new temporal axis (True) instead of re-initialising (False).
+    # vision_3d_max_tokens: number of vision tokens emitted per CT volume (adaptive-pooling target). Required
+    #   when training on volumes; each volume expands to this many <video> tokens.
+    vision_3d_model: Optional[str] = None
+    vision_3d_trust_remote_code: bool = False
+    vision_3d_module_path: Optional[str] = None
+    vision_3d_inflate_weights: bool = True
+    vision_3d_max_tokens: Optional[int] = None
+
     def _init_device_map(self):
         """Prepare device map args"""
         if self.device_map:

@@ -341,4 +341,10 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
         res['task_type'] = task_type or self.task_type
         res['num_labels'] = num_labels or self.num_labels
 
-        return get_model_processor(**res)
+        model, processor = get_model_processor(**res)
+        # Optionally attach a secondary 3D vision encoder (for CT volumes) as `model.visual_3d`.
+        # No-op unless `--vision_3d_model` is set, so default behaviour is unchanged.
+        if model is not None and getattr(self, 'vision_3d_model', None):
+            from swift.model.vision_3d import attach_vision_3d_encoder
+            attach_vision_3d_encoder(model, processor, self)
+        return model, processor
