@@ -259,16 +259,29 @@ class SglangEngine(InferEngine):
             usage=usage_info,
             id=random_uuid())
 
+    @staticmethod
+    def _to_engine_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
+        # sglang>=0.5.x renamed multimodal kwargs: images/audios/videos -> *_data
+        rename = {'images': 'image_data', 'audios': 'audio_data', 'videos': 'video_data'}
+        engine_inputs = {}
+        for k, v in inputs.items():
+            if k == 'template_inputs':
+                continue
+            engine_inputs[rename.get(k, k)] = v
+        return engine_inputs
+
     async def _infer_full_async(self, inputs: Dict[str, Any], generation_config: Dict[str, Any],
                                 request_config: RequestConfig) -> ChatCompletionResponse:
-        engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
+        # engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
+        engine_inputs = self._to_engine_inputs(inputs)
         output = await self.engine.async_generate(**engine_inputs, sampling_params=generation_config)
         output['prompt_token_ids'] = inputs['input_ids']
         return self._create_chat_completion_response(output, inputs, request_config.return_details)
 
     async def _infer_stream_async(self, inputs: Dict[str, Any], generation_config: Dict[str, Any],
                                   **kwargs) -> AsyncIterator[ChatCompletionStreamResponse]:
-        engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
+        # engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
+        engine_inputs = self._to_engine_inputs(inputs)
         result_generator = await self.engine.async_generate(
             **engine_inputs, sampling_params=generation_config, stream=True)
         infer_streamer = InferStreamer(self.template, template_inputs=inputs['template_inputs'])
