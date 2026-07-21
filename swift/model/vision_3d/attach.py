@@ -44,10 +44,54 @@ def infer_encoder_dim(tower: nn.Module) -> Optional[int]:
     return None
 
 
+def _load_trained_vision_3d_weights(backbone: nn.Module, model_dir: Optional[str]) -> int:
+    """Overlay trained `visual_3d.*` weights from a checkpoint dir onto a freshly-built backbone.
+
+    When `--model` points at a checkpoint produced by this fork, its safetensors carry the trained
+    `visual_3d.encoder.*` / `visual_3d.proj.*` tensors. The base VLM load drops them (unknown to the
+    host architecture), so we build the backbone skeleton, then copy those trained tensors in here.
+    Returns the number of tensors loaded (0 => fresh training from a base VLM, nothing to overlay).
+    """
+    import glob
+    import os
+    if not model_dir or not os.path.isdir(model_dir):
+        return 0
+    prefix = 'visual_3d.'
+    state = {}
+    shards = sorted(glob.glob(os.path.join(model_dir, '*.safetensors')))
+    if shards:
+        from safetensors import safe_open
+        for shard in shards:
+            with safe_open(shard, framework='pt') as f:
+                for k in f.keys():
+                    if k.startswith(prefix):
+                        state[k[len(prefix):]] = f.get_tensor(k)
+    else:
+        for b in sorted(glob.glob(os.path.join(model_dir, 'pytorch_model*.bin'))):
+            for k, v in torch.load(b, map_location='cpu').items():
+                if k.startswith(prefix):
+                    state[k[len(prefix):]] = v
+    if not state:
+        return 0
+    missing, unexpected = backbone.load_state_dict(state, strict=False)
+    logger.info(f'vision_3d: overlaid {len(state)} trained visual_3d tensors from checkpoint `{model_dir}` '
+                f'(missing={len(missing)}, unexpected={len(unexpected)}).')
+    return len(state)
+
+
 def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackbone:
-    """Load `args.vision_3d_model`'s vision encoder, make it 3D, and set it as `model.visual_3d`."""
+    """Load `args.vision_3d_model`'s vision encoder, make it 3D, and set it as `model.visual_3d`.
+
+    Architecture parameters (in_channels, encoder_dim, max_tokens, temporal_patch_size, volume size)
+    are taken from a `vision_3d_config` saved on `model.config` when present (i.e. reloading a trained
+    2D+3D checkpoint), so the rebuilt skeleton matches the saved weights exactly; otherwise they come
+    from the CLI args (fresh training). After the skeleton is built, trained `visual_3d.*` weights are
+    overlaid from the checkpoint dir if present.
+    """
+    saved = getattr(getattr(model, 'config', None), 'vision_3d_config', None) or {}
     logger.info(f'vision_3d: attaching secondary 3D vision encoder from `{args.vision_3d_model}` '
-                f'(trust_remote_code={args.vision_3d_trust_remote_code}).')
+                f'(trust_remote_code={args.vision_3d_trust_remote_code}, '
+                f'from_saved_config={bool(saved)}).')
 
     source = load_vision_3d_source_model(
         args.vision_3d_model,
@@ -59,11 +103,14 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
     tower = extract_vision_tower(source, module_path=args.vision_3d_module_path, model_type=None)
 
     # Number of input channels = number of CT windowing channels (set by the template args; default 1).
-    in_channels = int(getattr(args, 'ct_num_channels', None) or 1)
+    # On reload, prefer the value baked into the saved config so the patch embed matches the weights.
+    in_channels = int(saved.get('in_channels') or getattr(args, 'ct_num_channels', None) or 1)
+    temporal_patch_size = int(saved.get('temporal_patch_size') or DEFAULT_TEMPORAL_PATCH_SIZE)
+    max_tokens = args.vision_3d_max_tokens if args.vision_3d_max_tokens is not None else saved.get('vision_3d_max_tokens')
     ensure_conv3d_patch_embed(
         tower,
         in_channels=in_channels,
-        temporal_patch_size=DEFAULT_TEMPORAL_PATCH_SIZE,
+        temporal_patch_size=temporal_patch_size,
         inflate=args.vision_3d_inflate_weights,
     )
 
@@ -73,11 +120,13 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
     from .atlas import AtlasAdapter, atlas_modality, atlas_token_dim, is_atlas_tower
     from .qwen_vl import QwenVLVideoAdapter, is_qwen_vl_tower, qwen_vl_token_dim
     adapter = None
+    adapter_type = None
     if is_atlas_tower(tower):
+        adapter_type = 'atlas'
         adapter = AtlasAdapter(atlas_modality(tower))
         # Atlas's multiscale layout is derived from the modality's configured image_size, so it must
         # match the actual input size produced by the template (`--ct_volume_size`). Sync it here.
-        vol_size = getattr(args, 'ct_volume_size', None)
+        vol_size = getattr(args, 'ct_volume_size', None) or saved.get('ct_volume_size')
         if vol_size:
             from swift.utils.ct_volume_io import parse_volume_size
             size = list(parse_volume_size(vol_size))
@@ -90,6 +139,7 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
         enc_dim = atlas_token_dim(tower) or infer_encoder_dim(tower) or llm_hidden
     elif is_qwen_vl_tower(tower):
         # Photon-style: drive a Qwen-VL vision tower on volumes patchified as video.
+        adapter_type = 'qwen_vl'
         adapter = QwenVLVideoAdapter.from_tower(tower)
         enc_dim = qwen_vl_token_dim(tower) or infer_encoder_dim(tower) or llm_hidden
         logger.info(f'vision_3d: using QwenVLVideoAdapter (patch_size={adapter.patch_size}, '
@@ -101,14 +151,16 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
             logger.warning(f'vision_3d: could not infer encoder output dim; defaulting projector input to LLM hidden '
                            f'size ({llm_hidden}).')
             enc_dim = llm_hidden
+    # On reload, the saved encoder_dim wins so the projector shape matches the trained proj weights.
+    enc_dim = int(saved.get('encoder_dim') or enc_dim)
     logger.info(f'vision_3d: projector {enc_dim} -> {llm_hidden} (in_channels={in_channels}, '
-                f'max_tokens={args.vision_3d_max_tokens}).')
+                f'max_tokens={max_tokens}).')
 
     backbone = Vision3DBackbone(
         tower,
         encoder_dim=enc_dim,
         llm_hidden_size=llm_hidden,
-        max_tokens=args.vision_3d_max_tokens,
+        max_tokens=max_tokens,
         adapter=adapter,
     )
     target_dtype = getattr(model, 'dtype', None) or args.torch_dtype or torch.float32
@@ -120,7 +172,29 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
     # and Vision3DBackbone casts the encoder output to the projector dtype before projecting).
     backbone.proj.to(dtype=target_dtype)
 
+    # Reloading a trained checkpoint: overlay the trained visual_3d weights on top of the skeleton
+    # (which currently holds freshly-loaded pretrained-encoder + randomly-initialised projector weights).
+    _load_trained_vision_3d_weights(backbone, getattr(args, 'model_dir', None))
+
     model.visual_3d = backbone
+    # Record how the 3D encoder was built so the checkpoint is self-describing: this dict is written to
+    # config.json by save_pretrained, and read back above (`saved`) when the checkpoint is reloaded.
+    if getattr(model, 'config', None) is not None:
+        model.config.vision_3d_config = {
+            'vision_3d_model': args.vision_3d_model,
+            'vision_3d_module_path': args.vision_3d_module_path,
+            'vision_3d_trust_remote_code': bool(args.vision_3d_trust_remote_code),
+            'vision_3d_inflate_weights': bool(args.vision_3d_inflate_weights),
+            'vision_3d_max_tokens': max_tokens,
+            'in_channels': in_channels,
+            'encoder_dim': enc_dim,
+            'llm_hidden_size': int(llm_hidden),
+            'adapter_type': adapter_type,
+            'temporal_patch_size': temporal_patch_size,
+            'ct_volume_size': getattr(args, 'ct_volume_size', None) or saved.get('ct_volume_size'),
+            'ct_windows': list(getattr(args, 'ct_windows', None) or []) or saved.get('ct_windows'),
+            'ct_window_base': getattr(args, 'ct_window_base', None) or saved.get('ct_window_base'),
+        }
     # release any non-vision parts of the source model (e.g. a full VLM's LLM tower)
     del source
     logger.info(f'vision_3d: attached model.visual_3d = {backbone.__class__.__name__}'

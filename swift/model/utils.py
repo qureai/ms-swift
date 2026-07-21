@@ -266,8 +266,11 @@ def _patch_conv3d():
     def forward(self, x):
         if any(s != k for s, k in zip(self.stride, self.kernel_size)) or any(p != 0 for p in self.padding) or any(
                 d != 1 for d in self.dilation) or self.groups != 1:
-            raise NotImplementedError(
-                'Patched Conv3d only supports stride=kernel_size, padding=0, dilation=1, groups=1')
+            # The unfold+linear fast path only models patchify convs (stride==kernel, no padding), e.g.
+            # Qwen-VL's video patch embed. For any other geometry (e.g. the Pillar0/Atlas 3D encoder's
+            # overlapping/padded conv_down), fall back to the native Conv3d forward, which handles the
+            # general case correctly on this torch version.
+            return self._original_forward(x)
         N = x.shape[0]
         K = self.kernel_size
         x = x.unfold(2, K[0], K[0]).unfold(3, K[1], K[1]).unfold(4, K[2], K[2])

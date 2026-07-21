@@ -122,8 +122,6 @@ class Volume3DTemplateMixin:
 
     # ---- embedding-time dual routing (Qwen2.5-VL style: splice both here) ------------------------
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.is_training:
-            return inputs
         self._debug_start(model, inputs)
         input_ids = inputs['input_ids']
         base_model = self.get_base_model(model)
@@ -131,11 +129,27 @@ class Volume3DTemplateMixin:
             inputs_embeds = base_model.model.embed_tokens(input_ids)
         else:
             inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
-        # 2D path: images -> model.visual (also emits a zeroed dummy for text-only/volume-only batches).
-        inputs_embeds = self._get_inputs_embeds_hf(inputs_embeds, inputs, model.visual, self.processor, model.config)
-        # 3D path: CT volumes -> model.visual_3d, spliced into <video> token positions.
+        if self.is_training:
+            # Training: swift owns both splices. 2D path: images -> model.visual (also emits a zeroed
+            # dummy for text-only/volume-only batches so the 2D tower stays in the DDP graph).
+            inputs_embeds = self._get_inputs_embeds_hf(inputs_embeds, inputs, model.visual, self.processor,
+                                                       model.config)
+            # 3D path: CT volumes -> model.visual_3d, spliced into <video> token positions.
+            inputs_embeds = self._splice_volume_embeds(inputs_embeds, inputs, model)
+            return {'inputs_embeds': inputs_embeds}
+        # Inference/generation with NO CT volume: leave everything to native HF (return inputs
+        # untouched) so the 2D image / text path is byte-for-byte identical to upstream ms-swift.
+        if inputs.get('pixel_values_volumes') is None:
+            return inputs
+        # Inference/generation WITH a CT volume: splice ONLY the 3D volume here (HF has no knowledge of
+        # model.visual_3d) and pass the 2D image tensors through so the HF forward still encodes images
+        # with model.visual and merges them into our inputs_embeds itself -- 2D handling stays native.
         inputs_embeds = self._splice_volume_embeds(inputs_embeds, inputs, model)
-        return {'inputs_embeds': inputs_embeds}
+        out = {'inputs_embeds': inputs_embeds}
+        for key in ('pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw', 'second_per_grid_ts'):
+            if inputs.get(key) is not None:
+                out[key] = inputs[key]
+        return out
 
     def _dummy_volume(self) -> torch.Tensor:
         """A tiny zero volume matching the configured channel/size, to keep visual_3d in the graph."""

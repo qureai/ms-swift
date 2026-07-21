@@ -343,8 +343,40 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
 
         model, processor = get_model_processor(**res)
         # Optionally attach a secondary 3D vision encoder (for CT volumes) as `model.visual_3d`.
-        # No-op unless `--vision_3d_model` is set, so default behaviour is unchanged.
-        if model is not None and getattr(self, 'vision_3d_model', None):
-            from swift.model.vision_3d import attach_vision_3d_encoder
-            attach_vision_3d_encoder(model, processor, self)
+        # Triggered when `--vision_3d_model` is set, OR when loading a checkpoint whose config records a
+        # `vision_3d_config` -- so a trained 2D+3D checkpoint reloads its full architecture (encoder +
+        # projector, with trained weights) automatically. No-op otherwise (default behaviour unchanged).
+        if model is not None:
+            saved_v3d = getattr(getattr(model, 'config', None), 'vision_3d_config', None)
+            if getattr(self, 'vision_3d_model', None) or saved_v3d:
+                self._recover_vision_3d_args(saved_v3d)
+                from swift.model.vision_3d import attach_vision_3d_encoder
+                attach_vision_3d_encoder(model, processor, self)
         return model, processor
+
+    def _recover_vision_3d_args(self, saved) -> None:
+        """Backfill unset 3D-encoder / CT args from a checkpoint's saved `vision_3d_config`.
+
+        Lets a trained 2D+3D checkpoint reload even if the reload script does not re-pass every
+        `--vision_3d_*` / `--ct_*` flag. Explicitly-passed args always win (only `None`/empty is filled).
+        """
+        if not saved:
+            return
+        if not getattr(self, 'vision_3d_model', None):
+            self.vision_3d_model = saved.get('vision_3d_model')
+        if getattr(self, 'vision_3d_module_path', None) is None:
+            self.vision_3d_module_path = saved.get('vision_3d_module_path')
+        if getattr(self, 'vision_3d_max_tokens', None) is None:
+            self.vision_3d_max_tokens = saved.get('vision_3d_max_tokens')
+        if saved.get('vision_3d_trust_remote_code'):
+            self.vision_3d_trust_remote_code = True
+        # CT data args -- needed so the template loads volumes with the SAME channel count / resolution
+        # the encoder was trained on (a mismatch would break the patch-embed / masked_scatter shapes).
+        if not getattr(self, 'ct_windows', None) and saved.get('ct_windows'):
+            self.ct_windows = saved['ct_windows']
+        if getattr(self, 'ct_window_base', None) in (None, 'full_range') and saved.get('ct_window_base'):
+            self.ct_window_base = saved['ct_window_base']
+        if getattr(self, 'ct_volume_size', None) is None and saved.get('ct_volume_size'):
+            self.ct_volume_size = saved['ct_volume_size']
+        if saved.get('in_channels'):
+            self.ct_num_channels = saved['in_channels']

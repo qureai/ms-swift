@@ -8,23 +8,25 @@
 set -euo pipefail
 
 # --- Edit these for your run -------------------------------------------------
-SCRIPT=/cache/fast_data_nas8/janhavi/VLM_qure/vlm/swift/examples/infer/sglang/sglang_api_infer.py
+SCRIPT=/cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/examples/infer/sglang/sglang_api_infer.py
 # DATASET=/cache/fast_data_nas8/vlm_team_data/janhavi/22_Nov_testing_master_updated_new_tag_corrected.csv
-DATASET=/cache/fast_data_nas8/vlm_team_data/janhavi/vlm_eval/13_July_2026_prod_filtered_high_score_reports_140k_eval.parquet
-OUTPUT_DIR=/cache/fast_data_nas71/janhavi/vlm_results/SAHIL_Qwen_2_5_vl_8b_2611_corrected_pretraining_cleaned_bbox_segmed_prod
-TASK=autoreporting
+DATASET=/cache/fast_data_nas71/janhavi/data/vlm_eval/13_July_2026_prod_filtered_high_score_reports_140k_eval.parquet
+# OUTPUT_DIR=/cache/fast_data_nas71/janhavi/vlm_results/SAHIL_Qwen_2_5_vl_8b_2611_corrected_pretraining_cleaned_bbox_segmed_prod
+OUTPUT_DIR=/cache/fast_data_nas71/janhavi/vlm_results/SAHIL_Qwen_2_5_vl_3b_2611_corrected_pretraining_cleaned_bbox_segmed_prod
+# TASK=autoreporting
+TASK=long_asp
 DATASET_NAME=prod_140k
 # DATASET_NAME=internal
 TEMPERATURE=0.5
-PROMPT="Generate a detailed ontology report of the given X-ray with Findings, Summary, Complete Reasoning, Impression, Recommendations, and Prominence Score."
-# PROMPT="Generate Answer Set Programming (ASP)-based reasoning for the provided medical image. Include multi-level diagnostic analysis and structured, step-wise clinical reasoning. Present the logic in a transparent, explainable format appropriate for computational reasoning frameworks."
+# PROMPT="Generate a detailed ontology report of the given X-ray with Findings, Summary, Complete Reasoning, Impression, Recommendations, and Prominence Score."
+PROMPT="Generate Answer Set Programming (ASP)-based reasoning for the provided medical image. Include multi-level diagnostic analysis and structured, step-wise clinical reasoning. Present the logic in a transparent, explainable format appropriate for computational reasoning frameworks."
 # server / client knobs
 BASE_URL=http://localhost:8000/v1
-# MODEL=Qwen2.5_3B          # must match --served_model_name in ../deploy/sglang.sh
-MODEL=Qwen2.5_8B
+MODEL=Qwen2.5_3B          # must match --served_model_name in ../deploy/sglang.sh
+# MODEL=Qwen2.5_8B
 CONCURRENCY=64            # in-flight requests; throughput saturates ~32 decodes on 4 GPUs
 MAX_PIXELS=$((3500 * 3500))
-MAX_TOKENS=8000           # <= server --max_new_tokens
+MAX_TOKENS=12000           # <= server --max_new_tokens
 SAVE_EVERY=30000          # successful rows per output parquet
 # ----------------------------------------------------------------------------
 

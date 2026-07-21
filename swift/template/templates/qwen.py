@@ -1514,9 +1514,13 @@ class Qwen3_VL_CT_Template(Volume3DTemplateMixin, Qwen3VLTemplate):
         return encoded
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.is_training:
-            return inputs
+        # Runs for BOTH training and generation. In either case the HF model merges 2D images
+        # (+ deepstack) itself from pixel_values, so we only splice the CT volumes here and pass the
+        # image tensors through untouched -- the 2D pathway is left entirely to native HF.
         self._debug_start(model, inputs)
+        # Inference with NO CT volume: fully native (identical to upstream Qwen3VLTemplate._post_encode).
+        if not self.is_training and inputs.get('pixel_values_volumes') is None:
+            return inputs
         input_ids = inputs['input_ids']
         base_model = self.get_base_model(model)
         if hasattr(base_model.model, 'embed_tokens'):
@@ -1526,7 +1530,7 @@ class Qwen3_VL_CT_Template(Volume3DTemplateMixin, Qwen3VLTemplate):
         # 3D volumes only; the HF model merges 2D images (+ deepstack) itself from pixel_values.
         inputs_embeds = self._splice_volume_embeds(inputs_embeds, inputs, model)
         out = {'inputs_embeds': inputs_embeds}
-        for key in ('pixel_values', 'image_grid_thw'):
+        for key in ('pixel_values', 'image_grid_thw', 'video_grid_thw'):
             if inputs.get(key) is not None:
                 out[key] = inputs[key]
         return out
