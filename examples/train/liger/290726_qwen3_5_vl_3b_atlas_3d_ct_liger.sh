@@ -31,7 +31,7 @@ export MAX_PIXELS=$((3500 * 3500))   # 12,250,000 px cap per image
 # resolution is set by --ct_volume_size and CT token count by --vision_3d_max_tokens (below). These
 # two only affect Qwen's native video path (which CT never uses); set here as requested.
 # (512/32 are token-scale; VIDEO_MAX_PIXELS=512 would be < one 28x28 patch, so we use the *_TOKEN_NUM vars.)
-export VIDEO_MAX_TOKEN_NUM=512
+export VIDEO_MAX_TOKEN_NUM=1024
 export VIDEO_MIN_TOKEN_NUM=32
 
 # ---- data --------------------------------------------------------------------------------------
@@ -43,6 +43,8 @@ export VIDEO_MIN_TOKEN_NUM=32
 #  `python test_cases/make_dummy_mixed_data.py`.)
 DATASET_PATHS=(
     "/cache/fast_data_nas71/janhavi/data/ct_training_data/15_July_2026_preliminary_ct_autoreporting_data.json"
+    "/cache/fast_data_nas71/janhavi/data/ct_training_data/21_July_vlm_ct_tag_extraction_json_presence_true.json"
+    "/cache/fast_data_nas71/janhavi/data/ct_training_data/21_July_ct_tag_extraction_cls_tokens.json"
 )
 for DATASET_PATH in "${DATASET_PATHS[@]}"; do
     if [[ ! -f "$DATASET_PATH" ]]; then
@@ -56,15 +58,15 @@ done
 CT_WINDOWS="lung,mediastinum,abdomen,liver,bone,brain,subdural,stroke,temporal_bone,soft_tissue"
 
 swift sft \
-    --model Qwen/Qwen2.5-VL-3B-Instruct \
-    --run_name 'qwen2_5_vl_3b_atlas_3d_ct' \
+    --model Qwen/Qwen3.5-4B \
+    --run_name '2907_qwen3_5_4b_atlas_3d_ct' \
     --vision_3d_model YalaLab/Pillar0-ChestCT \
     --vision_3d_trust_remote_code true \
-    --vision_3d_max_tokens 256 \
+    --vision_3d_max_tokens 1024 \
     --template qwen2_5_vl_ct \
     --ct_windows "$CT_WINDOWS" \
     --ct_window_base full_range \
-    --ct_volume_size 128,128,128 \
+    --ct_volume_size 256,256,256 \
     --ct_augment true \
     --ct_augment_prob 0.15 \
     --tuner_type full \
@@ -76,7 +78,7 @@ swift sft \
     --fp16 false --bf16 false \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 20 \
+    --gradient_accumulation_steps 3 \
     --gradient_checkpointing true \
     --learning_rate 1e-5 \
     --freeze_llm false \
@@ -84,26 +86,27 @@ swift sft \
     --freeze_aligner true \
     --trainable_parameters visual_3d \
     --num_train_epochs 1 \
-    --max_length 28000 \
+    --resume_from_checkpoint /cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/vlm_ckpts/2907_qwen3_5_4b_atlas_3d_ct/v4-20260730-123250/checkpoint-10500 \
+    --max_length 32000 \
     --warmup_ratio 0.05 \
-    --eval_steps 800 \
-    --save_steps 800 \
+    --eval_steps 2000 \
+    --save_steps 500 \
     --logging_steps 5 \
-    --save_total_limit 4 \
+    --save_total_limit 5 \
     --save_only_model false \
-    --dataloader_num_workers 8 \
-    --dataset_num_proc 8 \
+    --dataloader_num_workers 2 \
+    --dataset_num_proc 2 \
     --system 'You are a helpful medical assistant.' \
     --deepspeed zero3 \
     --attn_impl sdpa \
     --use_hf true \
     --use_liger_kernel true \
-    --report_to tensorboard \
+    --report_to wandb \
     --group_by_length false \
     --padding_free false \
     --packing false \
     --ddp_find_unused_parameters true \
-    --output_dir /cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/vlm_ckpts
+    --output_dir /cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/vlm_ckpts/2907_qwen3_5_4b_atlas_3d_ct
 
 # Notes:
 # * Trainable set = LLM + visual_3d (encoder + proj). --freeze_vit/--freeze_aligner true freeze the

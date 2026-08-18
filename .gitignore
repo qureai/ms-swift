@@ -27,6 +27,7 @@ wheels/
 *.egg
 /package
 /temp
+vlm_ckpts/
 MANIFEST
 
 # PyInstaller

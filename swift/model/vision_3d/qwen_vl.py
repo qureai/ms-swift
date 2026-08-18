@@ -78,7 +78,9 @@ class QwenVLVideoAdapter:
         grid_thw = torch.tensor([[gt, gh, gw]], dtype=torch.long, device=volume.device)
         return patches, grid_thw
 
-    def __call__(self, encoder, vols, max_tokens, grid=None):
+    def __call__(self, encoder, vols, max_tokens, grid=None, pool=True):
+        # pool=True -> mean-pool each volume to max_tokens and concat -> (n_vol * max_tokens, out_dim).
+        # pool=False -> return the FULL per-volume tokens (for the Perceiver resampler) -> (n_vol, M, out_dim).
         from .backbone import pool_tokens_to
         outs = []
         enc_dtype = next(encoder.parameters()).dtype
@@ -90,5 +92,5 @@ class QwenVLVideoAdapter:
             tokens = getattr(out, 'pooler_output', None)
             if tokens is None:
                 tokens = getattr(out, 'last_hidden_state', out)
-            outs.append(pool_tokens_to(tokens, max_tokens))
-        return torch.cat(outs, dim=0)
+            outs.append(pool_tokens_to(tokens, max_tokens) if pool else tokens)
+        return torch.cat(outs, dim=0) if pool else torch.stack(outs, dim=0)

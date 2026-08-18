@@ -32,14 +32,19 @@ class Vision3DBackbone(nn.Module):
                  encoder_dim: int,
                  llm_hidden_size: int,
                  max_tokens: Optional[int] = None,
-                 adapter: Optional[Callable] = None):
+                 adapter: Optional[Callable] = None,
+                 resampler: Optional[nn.Module] = None):
         super().__init__()
         self.encoder = encoder
         self.encoder_dim = encoder_dim
         self.llm_hidden_size = llm_hidden_size
         self.max_tokens = max_tokens
         self.adapter = adapter
-        # MLP projector encoder_dim -> llm_hidden_size (the "3D encoder MLP")
+        # Token aggregator + projector into LLM space. Either:
+        #  * `resampler` (Perceiver): learned latent queries cross-attend to the encoder tokens and map
+        #    encoder_dim -> llm_hidden_size, emitting exactly max_tokens tokens (replaces proj + mean-pool); or
+        #  * `proj` (default): a 2-layer MLP applied after a blind mean-pool to max_tokens.
+        self.resampler = resampler
         self.proj = nn.Sequential(
             nn.Linear(encoder_dim, llm_hidden_size),
             nn.GELU(),
@@ -75,6 +80,17 @@ class Vision3DBackbone(nn.Module):
         vols = pixel_values_volumes
         if vols.dim() == 4:  # single volume -> add volume-batch axis
             vols = vols.unsqueeze(0)
+
+        if self.resampler is not None:
+            # Learned path: get the encoder's FULL (unpooled) tokens per volume, then let the resampler
+            # cross-attend max_tokens latent queries over them and map to llm_hidden_size (no mean-pool, no proj).
+            if self.adapter is not None:
+                feats = self.adapter(self.encoder, vols, self.max_tokens, grid, pool=False)  # (n_vol, M, enc_dim)
+            else:
+                feats = torch.stack([self._encode_one(v) for v in vols], dim=0)  # (n_vol, M, enc_dim)
+            latents = self.resampler(feats)  # (n_vol, max_tokens, llm_hidden_size)
+            return latents.reshape(-1, latents.shape[-1])  # (n_vol * max_tokens, llm_hidden_size)
+
         if self.adapter is not None:
             # adapter handles the encoder's native input/forward and returns (n_vol * max_tokens, encoder_dim)
             feats = self.adapter(self.encoder, vols, self.max_tokens, grid)

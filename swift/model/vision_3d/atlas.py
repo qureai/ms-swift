@@ -79,30 +79,53 @@ class AtlasAdapter:
     def __init__(self, modality: str):
         self.modality = modality
 
-    def __call__(self, encoder, vols, max_tokens, grid=None):
-        from .backbone import pool_tokens_to
-        outs = []
-        for v in vols:  # (T, C, H, W)
-            x = v.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, D, H, W)
-            tokens = self._encode_tokens(encoder, x)  # (M, encoder_dim)
-            outs.append(pool_tokens_to(tokens, max_tokens))
-        return torch.cat(outs, dim=0)
+    def __call__(self, encoder, vols, max_tokens, grid=None, pool=True):
+        # Encode ALL volumes of the micro-batch in ONE Atlas forward (Atlas supports batch:
+        # MultiModalAtlas.forward uses bsz=image.shape[0]). Batching means BatchNorm3d normalizes over the
+        # whole micro-batch (per GPU) rather than per single volume -> more stable stats. All volumes are
+        # the same --ct_volume_size, so their token counts match and the batch is rectangular.
+        # pool=True  -> mean-pool each volume to max_tokens, flatten -> (n_vol * max_tokens, encoder_dim).
+        # pool=False -> return the FULL per-volume tokens (for the Perceiver resampler) -> (n_vol, M, enc_dim).
+        x = vols.permute(0, 2, 1, 3, 4).contiguous()  # (n_vol, C, D, H, W)
+        feats = self._encode_tokens(encoder, x)  # (n_vol, sum_N, encoder_dim)
+        if not pool:
+            return feats
+        pooled = self._pool_tokens(feats, max_tokens)  # (n_vol, max_tokens, encoder_dim)
+        # row-major flatten keeps volume 0's tokens first, then volume 1, ... (the <video> position order)
+        return pooled.reshape(-1, pooled.shape[-1])
+
+    @staticmethod
+    def _pool_tokens(feats: torch.Tensor, n_tokens: int) -> torch.Tensor:
+        """Adaptive-avg-pool a (B, M, C) token sequence to (B, n_tokens, C) along the token axis."""
+        if feats.shape[1] == n_tokens:
+            return feats
+        pooled = torch.nn.functional.adaptive_avg_pool1d(feats.transpose(1, 2).float(), n_tokens).transpose(1, 2)
+        return pooled.to(feats.dtype)
 
     def _encode_tokens(self, encoder, x):
+        """Run the Atlas tower on a batch `x` = (B, C, D, H, W); return pre-pool tokens (B, sum_N, C)."""
         captured = []
 
         def _pre_hook(_module, inputs):
             captured.append(inputs[0])  # (B, C, N_level)
 
         handle = encoder.maxpool.register_forward_pre_hook(_pre_hook)
+        enc_dtype = next(encoder.parameters()).dtype
+        # Atlas hard-casts its relative-position coords to fp32 (multimodal_msa.RelativePosEmb); when the
+        # tower runs in bf16/fp16 that fp32 tensor clashes with the bf16 `cpb_mlp` Linear
+        # ('expected mat1 and mat2 to have the same dtype'). Running the forward under autocast makes the
+        # Linear cast that fp32 input to the compute dtype (fixing the clash) while keeping norm/softmax in
+        # fp32 for stability. For a genuinely fp32 tower autocast is disabled -> path is byte-identical.
+        use_autocast = enc_dtype in (torch.bfloat16, torch.float16)
         try:
-            encoder({self.modality: x.to(next(encoder.parameters()).dtype)})
+            with torch.autocast(device_type=x.device.type, dtype=enc_dtype, enabled=use_autocast):
+                encoder({self.modality: x.to(enc_dtype)})
         finally:
             handle.remove()
         if not captured:
             raise RuntimeError('AtlasAdapter: no pre-pool features captured; the tower may not use `maxpool`.')
-        feats = torch.cat(captured, dim=2).transpose(1, 2)  # (B, sum_N, C)
-        return feats[0]  # (sum_N, C) for B == 1
+        # each captured level is (B, C, N_level); concat over the token axis -> (B, C, sum_N) -> (B, sum_N, C)
+        return torch.cat(captured, dim=2).transpose(1, 2)
 
 
 def atlas_modality(encoder: nn.Module) -> str:
@@ -141,6 +164,9 @@ def build_atlas_vision_tower(model_path: str,
     missing, unexpected = visual.load_state_dict(vision_state, strict=False)
     logger.info(f'vision_3d/atlas: built MultiModalAtlas vision tower and loaded {len(vision_state)} tensors '
                 f'(missing={len(missing)}, unexpected={len(unexpected)}).')
-    # Atlas mixes float32 positional math with its weights; keep the encoder in float32 to avoid
-    # dtype clashes. Only the downstream projector runs in the LLM dtype (set in `attach`).
-    return visual.float()
+    # Historically the tower was forced to float32 because Atlas's relative-position math hard-casts an
+    # intermediate to fp32 (multimodal_msa.RelativePosEmb), which clashes with bf16 weights. That single
+    # clash is now handled by an autocast wrap in `AtlasAdapter._encode_tokens`, so the tower can run in
+    # the run's dtype (bf16 -> ~half the memory + enables flash-attention on the LLM). Default to fp32
+    # when no dtype is requested (preserves the original numerically-safe behaviour).
+    return visual.to(dtype=torch_dtype) if torch_dtype is not None else visual.float()

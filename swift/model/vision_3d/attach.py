@@ -153,8 +153,23 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
             enc_dim = llm_hidden
     # On reload, the saved encoder_dim wins so the projector shape matches the trained proj weights.
     enc_dim = int(saved.get('encoder_dim') or enc_dim)
-    logger.info(f'vision_3d: projector {enc_dim} -> {llm_hidden} (in_channels={in_channels}, '
-                f'max_tokens={max_tokens}).')
+
+    # Token aggregator: 'none' -> mean-pool + MLP projector (default); 'perceiver' -> learned resampler.
+    # On reload the saved settings win so the rebuilt module matches the trained weights.
+    resampler_type = saved.get('resampler') or getattr(args, 'vision_3d_resampler', 'none')
+    resampler_depth = int(saved.get('resampler_depth') or getattr(args, 'vision_3d_resampler_depth', 2))
+    resampler_heads = int(saved.get('resampler_heads') or getattr(args, 'vision_3d_resampler_heads', 8))
+    resampler = None
+    if resampler_type == 'perceiver':
+        from .resampler import PerceiverResampler
+        resampler = PerceiverResampler(
+            input_dim=enc_dim, output_dim=llm_hidden, num_latents=max_tokens,
+            depth=resampler_depth, num_heads=resampler_heads)
+        logger.info(f'vision_3d: token aggregator = PerceiverResampler (latents={max_tokens}, '
+                    f'depth={resampler_depth}, heads={resampler_heads}); replaces mean-pool + MLP projector.')
+    else:
+        logger.info(f'vision_3d: projector {enc_dim} -> {llm_hidden} (in_channels={in_channels}, '
+                    f'max_tokens={max_tokens}).')
 
     backbone = Vision3DBackbone(
         tower,
@@ -162,15 +177,18 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
         llm_hidden_size=llm_hidden,
         max_tokens=max_tokens,
         adapter=adapter,
+        resampler=resampler,
     )
     target_dtype = getattr(model, 'dtype', None) or args.torch_dtype or torch.float32
     try:
         backbone = backbone.to(device=model.device)
     except Exception:  # device_map / sharded models may not expose a single .device
         pass
-    # The projector must match the LLM dtype; the encoder keeps its own (e.g. Atlas stays float32,
-    # and Vision3DBackbone casts the encoder output to the projector dtype before projecting).
+    # The projector/resampler must match the LLM dtype; the encoder keeps its own (e.g. Atlas float32,
+    # and its output is cast to the aggregator dtype before projecting/resampling).
     backbone.proj.to(dtype=target_dtype)
+    if backbone.resampler is not None:
+        backbone.resampler.to(dtype=target_dtype)
 
     # Reloading a trained checkpoint: overlay the trained visual_3d weights on top of the skeleton
     # (which currently holds freshly-loaded pretrained-encoder + randomly-initialised projector weights).
@@ -190,6 +208,9 @@ def attach_vision_3d_encoder(model: nn.Module, processor, args) -> Vision3DBackb
             'encoder_dim': enc_dim,
             'llm_hidden_size': int(llm_hidden),
             'adapter_type': adapter_type,
+            'resampler': resampler_type,
+            'resampler_depth': resampler_depth,
+            'resampler_heads': resampler_heads,
             'temporal_patch_size': temporal_patch_size,
             'ct_volume_size': getattr(args, 'ct_volume_size', None) or saved.get('ct_volume_size'),
             'ct_windows': list(getattr(args, 'ct_windows', None) or []) or saved.get('ct_windows'),

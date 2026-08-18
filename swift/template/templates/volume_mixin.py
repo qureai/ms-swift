@@ -146,8 +146,17 @@ class Volume3DTemplateMixin:
         # with model.visual and merges them into our inputs_embeds itself -- 2D handling stays native.
         inputs_embeds = self._splice_volume_embeds(inputs_embeds, inputs, model)
         out = {'inputs_embeds': inputs_embeds}
+        # Only forward vision kwargs the host model's forward actually accepts. Qwen2.5-VL takes
+        # `second_per_grid_ts`, but other hosts that reuse this template (e.g. Qwen3.5) do not, and HF's
+        # `generate` raises on unexpected model_kwargs. Filter by the base model's forward signature.
+        import inspect
+        try:
+            # `model` is the object generate() is called on -- match what HF validates against.
+            accepted = set(inspect.signature(model.forward).parameters)
+        except (TypeError, ValueError):
+            accepted = None
         for key in ('pixel_values', 'pixel_values_videos', 'image_grid_thw', 'video_grid_thw', 'second_per_grid_ts'):
-            if inputs.get(key) is not None:
+            if inputs.get(key) is not None and (accepted is None or key in accepted):
                 out[key] = inputs[key]
         return out
 

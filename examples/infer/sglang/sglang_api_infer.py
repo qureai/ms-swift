@@ -144,6 +144,11 @@ async def call_api(client: 'openai.AsyncOpenAI', data_uri: str, args) -> str:
                 }],
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
+                # top_p/top_k MUST be sent: this checkpoint's generation_config.json
+                # omits them, so swift falls back to None and sglang's verify() crashes
+                # with "'<' not supported between float and NoneType". See --top-p/--top-k.
+                top_p=args.top_p,
+                extra_body={'top_k': args.top_k},
             )
             return resp.choices[0].message.content
         except Exception as e:  # noqa: BLE001
@@ -246,6 +251,10 @@ if __name__ == '__main__':
                         help='Downscale images so w*h <= this before sending (0 = no client-side resize)')
     parser.add_argument('--max-tokens', type=int, default=8000, help='Max new tokens (<= server max_new_tokens)')
     parser.add_argument('--temperature', type=float, default=0.5)
+    parser.add_argument('--top-p', type=float, default=0.8,
+                        help='Nucleus sampling; must be sent because the checkpoint gen config omits it')
+    parser.add_argument('--top-k', type=int, default=20,
+                        help='Top-k sampling; must be sent because the checkpoint gen config omits it')
     parser.add_argument('--max-retries', type=int, default=5, help='Retries per request on failure')
     parser.add_argument('--retry-delay', type=float, default=3.0, help='Base backoff seconds (multiplied by attempt)')
     parser.add_argument('--save-every', type=int, default=10000, help='Flush a parquet every N successful rows')

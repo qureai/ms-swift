@@ -104,11 +104,19 @@ class ModelArguments:
     #   inflate the pretrained 2D weights across the new temporal axis (True) instead of re-initialising (False).
     # vision_3d_max_tokens: number of vision tokens emitted per CT volume (adaptive-pooling target). Required
     #   when training on volumes; each volume expands to this many <video> tokens.
+    # vision_3d_resampler: how the encoder's token set is reduced to `vision_3d_max_tokens` tokens and mapped
+    #   into the LLM space. 'none' (default) = blind mean-pool + a 2-layer MLP projector (original behaviour);
+    #   'perceiver' = a learned Perceiver resampler (latent queries cross-attend to the encoder tokens) that
+    #   replaces both the mean-pool and the MLP -- learns *which* tokens to keep instead of averaging.
+    # vision_3d_resampler_depth / _heads: cross-attention layers / attention heads in the Perceiver resampler.
     vision_3d_model: Optional[str] = None
     vision_3d_trust_remote_code: bool = False
     vision_3d_module_path: Optional[str] = None
     vision_3d_inflate_weights: bool = True
     vision_3d_max_tokens: Optional[int] = None
+    vision_3d_resampler: Literal['none', 'perceiver'] = 'none'
+    vision_3d_resampler_depth: int = 2
+    vision_3d_resampler_heads: int = 8
 
     def _init_device_map(self):
         """Prepare device map args"""
