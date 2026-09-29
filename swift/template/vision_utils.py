@@ -40,6 +40,22 @@ def _resolve_storage_path(path: str) -> Union[str, None]:
     return None
 
 
+def _resolve_image_path(path: str) -> Union[str, None]:
+    if path.startswith('http'):
+        return path
+
+    original_path = path
+    base_name = os.path.basename(path)
+    parts = base_name.split('_', 2)
+
+    if len(parts) == 3 and 'image_' in base_name:
+        original_filename = parts[2]
+        base_dir = os.path.dirname(original_path)
+        original_path = os.path.join(base_dir, original_filename)
+
+    return _resolve_storage_path(original_path)
+
+
 # >>> internvl
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -188,7 +204,7 @@ def load_file(path: Union[str, bytes, _T]) -> Union[BytesIO, _T]:
 
 
 def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
-    original_input = image
+    original_input = image  # for logging if needed
     width, height = None, None
 
     try:
@@ -198,22 +214,16 @@ def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
 
         # Case 2: It's a path
         elif isinstance(image, str):
-            original_path = image
             base_name = os.path.basename(image)
             parts = base_name.split('_', 2)
+            if len(parts) == 3 and 'image_' in base_name:
+                width, height = map(int, parts[1].split('x'))
 
-            if len(parts) == 3 and "image_" in base_name:
-                res_str = parts[1]
-                original_filename = parts[2]
-                width, height = map(int, res_str.split('x'))
-                base_name = original_filename
-                base_dir = os.path.dirname(original_path)
-                original_path = os.path.join(base_dir, base_name)
-
-            resolved_path = _resolve_storage_path(original_path)
-            if not resolved_path:
-                raise FileNotFoundError(f"Image not found: {original_path}")
-            image = load_file(resolved_path)
+            resolved_path = _resolve_image_path(image)
+            if resolved_path:
+                image = load_file(resolved_path)
+            else:
+                raise FileNotFoundError(f'Image not found on {_STORAGE_ROOTS}: {image}')
 
         # Case 3: It's bytes
         elif isinstance(image, bytes):
@@ -222,21 +232,28 @@ def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
         # Case 4: Decode if BytesIO
         if isinstance(image, BytesIO):
             image = Image.open(image)
-            
 
         # Ensure RGB mode
         if image.mode != 'RGB':
             image = image.convert('RGB')
-        
+
         if width is not None and height is not None:
             # print(f"Resizing image to {width}x{height}")
             image = image.resize((width, height), Image.LANCZOS)
 
         return image
 
+    # THIS IS THE CRITICAL BLOCK THAT IS MISSING FROM YOUR RUNNING CODE
     except Exception as e:
         print(f"[WARN] Failed to load image: {e}")
         print(f"Original input: {original_input}")
+
+        # When SKIP_BROKEN_IMAGES is set (train/export), re-raise so the encode layer with
+        # strict=False DROPS the whole datapoint instead of training on a noise placeholder.
+        # When unset (inference/serving), fall back to a random RGB image so nothing crashes.
+        if os.environ.get('SKIP_BROKEN_IMAGES', '').lower() in {'1', 'true', 'yes'}:
+            raise
+
         # Fallback: random RGB image
         return Image.frombytes(
             'RGB',

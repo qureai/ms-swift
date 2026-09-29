@@ -93,7 +93,7 @@ swift sft \
     --save_total_limit 5 \
     --save_only_model false \
     --output_dir output/15_NOV_pretraining-Qwen3.5-4B_pretraining_cleaned_bbox_segmed_prod \
-    --resume_from_checkpoint output/15_NOV_pretraining-Qwen3.5-4B_pretraining_cleaned_bbox_segmed_prod/v15-20260611-093218/checkpoint-800/ \
+    --resume_from_checkpoint output/15_NOV_pretraining-Qwen3.5-4B_pretraining_cleaned_bbox_segmed_prod/v18-20260617-193117/checkpoint-9600 \
     --system 'You are a helpful medical assistant.' \
     --deepspeed zero2 \
     --attn_impl flash_attention_2 \
