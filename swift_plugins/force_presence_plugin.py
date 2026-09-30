@@ -7,8 +7,20 @@ Env:
   MLD_FORCE_TAU_JSON   path to {finding_key: tau} for per-tag control (optional)
   MLD_FORCE_OUT        path to dump per-finding decisions jsonl      (optional)
 Use --infer_backend pt --max_batch_size 1.
+
+Inference-only and deliberately NOT mode-gated (installs under any qure_plugin_mode).
+ONE COPY PER PROCESS (F1): registered under both `force_presence_plugin` and
+`swift_plugins.force_presence_plugin`; _install() is once()-guarded (a second copy would append a
+second forcing LogitsProcessor). QURE_PLUGIN_DEDUP=0 restores the legacy behaviour.
 """
-import json, os, re
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'force_presence_plugin')
+
+import json, os, re  # noqa: E401,E402
 import torch
 from transformers import LogitsProcessor, LogitsProcessorList
 from swift.utils import get_logger
@@ -59,6 +71,8 @@ class ForcePresence(LogitsProcessor):
 
 
 def _install():
+    if not _once('force_presence_plugin._install'):
+        return  # F1: already installed in this process
     from swift.template.base import Template
     orig = Template.prepare_generate_kwargs
     _procs = {}

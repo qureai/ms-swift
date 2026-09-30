@@ -27,10 +27,21 @@ Weights are applied by SPLITTING the response string into segments, each returne
 weight; swift then tokenizes each segment and repeats the weight across its tokens
 (swift/template/base.py:_encode_context_list). So the split points must land on real
 character boundaries in the response text.
+
+ONE COPY PER PROCESS (F1): the first statements register this module under both
+`qure_graded_loss_scale` and `swift_plugins.qure_graded_loss_scale`, and the registration is
+once()-guarded. QURE_PLUGIN_DEDUP=0 restores the legacy behaviour (see qure_plugin_mode.py).
 """
-import os
-import re
-from typing import List, Tuple
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'qure_graded_loss_scale')
+
+import os  # noqa: E402
+import re  # noqa: E402
+from typing import List, Tuple  # noqa: E402
 
 from swift.loss_scale.base import LossScale
 from swift.loss_scale.mapping import loss_scale_map
@@ -121,7 +132,8 @@ class QureGradedLossScale(LossScale):
         return [context], [W_DEFAULT]
 
 
-loss_scale_map['qure_graded'] = QureGradedLossScale
-logger.info(f'[qure-loss-scale] registered `qure_graded` · format={W_FORMAT} name={W_NAME} '
-            f'false={W_FALSE} true={W_TRUE} asp_finding={W_ASP_FINDING} '
-            f'graph_finding={W_GRAPH_FINDING}')
+if _once('qure_graded_loss_scale.register'):  # F1: one registration per process
+    loss_scale_map['qure_graded'] = QureGradedLossScale
+    logger.info(f'[qure-loss-scale] registered `qure_graded` · format={W_FORMAT} name={W_NAME} '
+                f'false={W_FALSE} true={W_TRUE} asp_finding={W_ASP_FINDING} '
+                f'graph_finding={W_GRAPH_FINDING}')

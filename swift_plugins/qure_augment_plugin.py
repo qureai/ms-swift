@@ -28,9 +28,23 @@ CACHING CAVEAT: with `--cached_dataset` the augmentation is applied ONCE at enco
 frozen into the cache, so every epoch sees identical pixels. That is harmless at
 num_train_epochs=1 (each sample is seen once anyway) but wrong for multi-epoch training --
 use `--lazy_tokenize true` there so encode, and therefore augmentation, reruns each epoch.
+
+ONE COPY PER PROCESS (F1). The first statements below register this module under both
+`qure_augment_plugin` (how --external_plugins imports it) and `swift_plugins.qure_augment_plugin`
+(how qure_stage3_plugin used to import it), and patch_template() is once()-guarded. Before this,
+the second name re-executed the file and stacked a SECOND RandAugment wrapper: non-bbox images
+were augmented twice and bbox rows still got geometric augmentation. QURE_PLUGIN_DEDUP=0 restores
+the legacy double import (see qure_plugin_mode.py).
 """
-import os
-import sys
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'qure_augment_plugin')
+
+import os  # noqa: E402
+import sys  # noqa: E402
 
 import numpy as np
 from PIL import Image
@@ -180,6 +194,8 @@ def augment_pil_photometric(img: Image.Image) -> Image.Image:
 
 def patch_template():
     """Augment inside _preprocess_inputs, after images are loaded to PIL, training only."""
+    if not _once('qure_augment_plugin.patch_template'):
+        return  # F1: already wrapped in this process -- never stack a second augmentation
     from swift.template.templates.qwen import Qwen3_5Template
 
     orig = Qwen3_5Template._preprocess_inputs

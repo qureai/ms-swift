@@ -21,10 +21,21 @@ exactly as in the Qwen plugin.
 
 Everything else (ASL, label sidecar, head param-group, ASL-weight schedule, eval AUC dump,
 JSON-logprob AUC) is identical to the Qwen plugin.
+
+ONE COPY PER PROCESS (F1): the first statements register this module under both
+`mldecoder_joint_internvl_plugin` and `swift_plugins.mldecoder_joint_internvl_plugin`, and every
+patch_* function is once()-guarded. QURE_PLUGIN_DEDUP=0 restores the legacy behaviour.
 """
-import json
-import os
-import sys
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'mldecoder_joint_internvl_plugin')
+
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
 
 import torch
 import torch.nn as nn
@@ -325,6 +336,8 @@ class ASLwithClassWeight(nn.Module):
 # template: carry cls_labels + num_patches from the sidecar/encode through collate
 # =========================================================================================
 def patch_template():
+    if not _once('mldecoder_joint_internvl_plugin.patch_template'):
+        return  # F1: already patched in this process
     from swift.template.templates.internvl import Internvl2Template
 
     orig_encode_public = Internvl2Template.encode
@@ -503,6 +516,8 @@ def _per_tag_auc(logits, labels, tags):
 
 
 def patch_head_param_group():
+    if not _once('mldecoder_joint_internvl_plugin.patch_head_param_group'):
+        return  # F1: already patched in this process
     from swift.trainers.mixin import SwiftMixin
     orig = SwiftMixin.create_optimizer
 
@@ -530,6 +545,8 @@ def patch_head_param_group():
 
 
 def patch_step_probe():
+    if not _once('mldecoder_joint_internvl_plugin.patch_step_probe'):
+        return  # F1: already patched in this process
     from transformers import TrainerCallback
     from swift.trainers.mixin import SwiftMixin
 
@@ -654,8 +671,12 @@ def patch_step_probe():
 
 
 def patch_model_prepare():
+    if not _once('mldecoder_joint_internvl_plugin.patch_model_prepare'):
+        return  # F1: already patched in this process
     from swift.pipelines.train.tuner import TunerMixin
-    orig = TunerMixin.prepare_model.__func__
+    # plain function or classmethod depending on what earlier plugins installed (F3-1: a plugin
+    # listed before this one may have replaced the classmethod with a plain function)
+    orig = getattr(TunerMixin.prepare_model, '__func__', TunerMixin.prepare_model)
 
     @classmethod
     def prepare_model(cls, args, model, **kwargs):

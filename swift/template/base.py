@@ -26,6 +26,8 @@ from swift.utils import Processor, ProcessorMixin, get_env_args, get_logger, rem
 from .template_inputs import StdTemplateInputs, TemplateInputs
 from .utils import Context, ContextType, StopWordsCriteria, fetch_one, findall, get_last_user_round, split_str_parts_by
 from .vision_utils import _check_path, _resolve_image_path, load_audio, load_batch, load_image, rescale_image
+from .sem_latent import (get_sem_str, insert_sem_into_contexts, strip_sem, warn_if_sem_header_trained,  # [sem] no-op
+                         warn_if_sem_thinking_prefix)  # w/o SEM tokens
 
 logger = get_logger()
 if TYPE_CHECKING:
@@ -741,6 +743,9 @@ class Template(ProcessorMixin):
             kwargs['spaces_between_special_tokens'] = False
         generate_ids = self.skip_stop_tokens(generate_ids, is_finished)
         response = self.tokenizer.decode(generate_ids, **kwargs)
+        sem_str = get_sem_str(self.tokenizer)  # [sem] '' w/o SEM tokens: then a no-op
+        if sem_str:  # an emitted SEM id is never response text (fed-back history would carry a stray block)
+            response = strip_sem(response, sem_str)
         response_prefix = self._get_response_prefix(template_inputs)
         if first_token and response_prefix:
             response = response_prefix + response
@@ -1077,6 +1082,14 @@ class Template(ProcessorMixin):
     def _encode_context_list(self,
                              context_list: List[Context],
                              loss_scale_list: Optional[List[float]] = None) -> Tuple[List[int], List[int], List[float]]:
+        # [sem] SEM latent tokens (swift/template/sem_latent.py). Strict no-op -- the SAME objects flow on -- unless the
+        # tokenizer contains <|sem_0|> (and SWIFT_SEM_LATENT != 0). Then <|sem_0|>..<|sem_{K-1}|> go right after every
+        # '<|im_start|>assistant\n' in loss-scale-0 str contexts (labels -100). Every mode reaches this function.
+        sem_str = get_sem_str(self.tokenizer)
+        if sem_str:
+            context_list, loss_scale_list = insert_sem_into_contexts(context_list, loss_scale_list, sem_str)
+            warn_if_sem_thinking_prefix(self, context_list, sem_str)
+            warn_if_sem_header_trained(self, context_list, loss_scale_list)
         is_binary_loss_scale = self.is_binary_loss_scale
         if is_binary_loss_scale is None:
             is_binary_loss_scale = self.loss_scale.is_binary_loss_scale

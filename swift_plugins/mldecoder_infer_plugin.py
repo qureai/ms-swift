@@ -18,10 +18,29 @@ never fires there. Generation of the JSON text works on any backend; reading the
 Writes `<result_path>.cls_logits.jsonl`, one row per image:
     {"image": "...", "logits": [132 floats], "probs": [132 floats], "top": [[tag, prob], ...]}
 Set MLD_CLS_OUT to override the path.
+
+ONE COPY PER PROCESS (F1) / MODE (F2). The import of VisionMLDecoderHead below used to execute a
+SECOND mldecoder_joint_plugin (and, because the swift CLI always looked like `train`, install
+all its train patches) whenever the joint plugin was also listed. Both modules now register
+under both names (qure_plugin_mode.dedup_module) and the patches here are once()-guarded; under
+`swift infer` the joint plugin now sees inference mode and only lends its head class. This
+plugin itself is inference-only and is NOT mode-gated. QURE_PLUGIN_DEDUP=0 / QURE_PLUGIN_MODE=
+train restore the legacy behaviour. The head class falls back to a top-level `mldecoder_joint_plugin`
+import only when the `swift_plugins` package itself is not importable; an error raised inside the
+joint plugin propagates (as before F1).
 """
-import json
-import os
-import sys
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import (dedup_module as _dedup_module, once as _once,
+                                                drop_failed_import as _drop_failed_import)
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import (dedup_module as _dedup_module, once as _once,
+                                  drop_failed_import as _drop_failed_import)
+_dedup_module(__name__, 'mldecoder_infer_plugin')
+
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
 
 import torch
 
@@ -43,8 +62,19 @@ if FM_REPO not in sys.path:
     sys.path.insert(0, FM_REPO)
 
 # reuse the exact head definition used in training -- a re-implementation here could silently
-# diverge in shape or token grouping and load the checkpoint weights into the wrong slots
-from swift_plugins.mldecoder_joint_plugin import VisionMLDecoderHead  # noqa: E402
+# diverge in shape or token grouping and load the checkpoint weights into the wrong slots.
+# F1: with dedup on this returns the joint module already loaded under either name (no re-exec).
+# The top-level fallback is ONLY for "the swift_plugins package is not importable" (repo root not on
+# sys.path). An ImportError raised INSIDE the joint plugin's body propagates exactly as before F1 (the
+# fallback would otherwise hand back the half-initialised module its F1 alias left behind).
+try:
+    from swift_plugins.mldecoder_joint_plugin import VisionMLDecoderHead  # noqa: E402
+except ImportError as _e:
+    if not (isinstance(_e, ModuleNotFoundError)
+            and _e.name in ('swift_plugins', 'swift_plugins.mldecoder_joint_plugin')):
+        _drop_failed_import('mldecoder_joint_plugin')
+        raise
+    from mldecoder_joint_plugin import VisionMLDecoderHead  # noqa: E402
 
 _TAGS = json.load(open(f'{SIDECAR}/tags.json'))['tags']
 _STATE = {'fh': None, 'n': 0}
@@ -116,6 +146,8 @@ def attach_for_inference(model):
 
 
 def patch_engine():
+    if not _once('mldecoder_infer_plugin.patch_engine'):
+        return  # F1: already patched in this process
     from swift.infer_engine.transformers_engine import TransformersEngine
 
     orig = TransformersEngine.__init__
@@ -131,6 +163,8 @@ def patch_engine():
 
 def patch_template_dump():
     """After each forward, write the head logits for the images of that request."""
+    if not _once('mldecoder_infer_plugin.patch_template_dump'):
+        return  # F1: already patched in this process (a 2nd decode wrapper writes rows twice)
     from swift.template.templates.qwen import Qwen3_5Template
 
     orig_post = Qwen3_5Template._post_encode

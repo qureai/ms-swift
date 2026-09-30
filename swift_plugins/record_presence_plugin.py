@@ -4,8 +4,20 @@ generation — does NOT modify logits. One JSON line per image: {finding_key: p_
 
 Env: MLD_REC_OUT = output jsonl path.  Use --infer_backend pt.
 Align rows to the input val_dataset by ORDER (run with --val_dataset_shuffle false).
+
+Inference-only and deliberately NOT mode-gated (installs under any qure_plugin_mode).
+ONE COPY PER PROCESS (F1): registered under both `record_presence_plugin` and
+`swift_plugins.record_presence_plugin`; _install() is once()-guarded (a second copy would write
+every row twice). QURE_PLUGIN_DEDUP=0 restores the legacy behaviour.
 """
-import json, os, re
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'record_presence_plugin')
+
+import json, os, re  # noqa: E401,E402
 import torch
 from transformers import LogitsProcessor, LogitsProcessorList
 from swift.utils import get_logger
@@ -43,6 +55,8 @@ class RecordPresence(LogitsProcessor):
 
 
 def _install():
+    if not _once('record_presence_plugin._install'):
+        return  # F1: already installed in this process
     from swift.template.base import Template
     from swift.template.templates.qwen import Qwen3_5Template
     orig = Template.prepare_generate_kwargs

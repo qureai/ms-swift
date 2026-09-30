@@ -18,9 +18,21 @@ the source image means every dynamic tile of it is derived from the augmented pi
 CACHING/EPOCHS: with --lazy_tokenize true (as in the joint run) encode reruns each epoch, so a
 fresh augmentation is drawn per sample per epoch. Env knobs: QURE_AUG_PROB (default 1.0),
 QURE_AUG_CROP_MIN/MAX (0.10/0.15), QURE_AUG_IM_SIZE (None = keep native/dynamic resolution).
+
+ONE COPY PER PROCESS (F1): the first statements register this module under both
+`qure_augment_internvl_plugin` and `swift_plugins.qure_augment_internvl_plugin`, and
+patch_template() is once()-guarded (a second copy would augment every image twice).
+QURE_PLUGIN_DEDUP=0 restores the legacy behaviour (see qure_plugin_mode.py).
 """
-import os
-import sys
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'qure_augment_internvl_plugin')
+
+import os  # noqa: E402
+import sys  # noqa: E402
 
 import numpy as np
 from PIL import Image
@@ -107,6 +119,8 @@ def augment_pil(img: Image.Image) -> Image.Image:
 
 def patch_template():
     """Augment inside Internvl2Template._preprocess_inputs, after PIL load, training only."""
+    if not _once('qure_augment_internvl_plugin.patch_template'):
+        return  # F1: already wrapped in this process
     from swift.template.templates.internvl import Internvl2Template
 
     orig = Internvl2Template._preprocess_inputs

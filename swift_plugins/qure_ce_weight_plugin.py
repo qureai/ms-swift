@@ -33,10 +33,22 @@ WHAT THIS CANNOT DO -- be aware of the limits, they are real:
   * ASP / graph findings CANNOT be up-weighted this way at all -- "is this line a finding" is a
     property of position, not of token identity. That part genuinely needs either binary
     masking via loss_scale or a custom loss.
-"""
-import os
 
-import torch
+ONE COPY PER PROCESS (F1): the first statements register this module under both
+`qure_ce_weight_plugin` and `swift_plugins.qure_ce_weight_plugin` and both patches are
+once()-guarded (a second copy would wrap the fused CE twice and build the vector twice).
+QURE_PLUGIN_DEDUP=0 restores the legacy behaviour (see qure_plugin_mode.py).
+"""
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'qure_ce_weight_plugin')
+
+import os  # noqa: E402
+
+import torch  # noqa: E402
 
 from swift.utils import get_logger
 
@@ -105,6 +117,8 @@ def patch_liger_ce_weight():
     "no LigerFusedLinearCrossEntropyLoss instance found" and trained with NO weighting).
     Wrapping the function is the injection point that actually runs.
     """
+    if not _once('qure_ce_weight_plugin.patch_liger_ce_weight'):
+        return  # F1: already wrapped in this process
     from liger_kernel.transformers.model import loss_utils
 
     orig_fn = loss_utils.fixed_fused_linear_cross_entropy
@@ -135,9 +149,13 @@ def patch_liger_ce_weight():
 
 def patch_step_probe():
     """Build the vector once the tokenizer exists, before the first forward."""
+    if not _once('qure_ce_weight_plugin.patch_step_probe'):
+        return  # F1: already wrapped in this process
     from swift.pipelines.train.tuner import TunerMixin
 
-    orig = TunerMixin.prepare_model.__func__
+    # plain function or classmethod depending on what earlier plugins installed (F3-1: a plugin
+    # listed before this one may have replaced the classmethod with a plain function)
+    orig = getattr(TunerMixin.prepare_model, '__func__', TunerMixin.prepare_model)
 
     @classmethod
     def prepare_model(cls, args, model, **kwargs):

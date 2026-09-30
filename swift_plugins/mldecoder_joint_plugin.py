@@ -45,10 +45,23 @@ ASL. Re-implemented from foundation_model_accelerate/loss/classification_loss.py
 neg_weights=exp(p)) with two deliberate changes: weights live on the module as buffers instead
 of a hardcoded `.cuda()` (which breaks under deepspeed/device_map), and the loss is reduced
 here instead of returning an un-reduced tensor.
+
+ONE COPY PER PROCESS (F1). The first statements below register this module under both
+`mldecoder_joint_plugin` and `swift_plugins.mldecoder_joint_plugin`, and every patch_* function
+is once()-guarded, so mldecoder_infer_plugin's `from swift_plugins.mldecoder_joint_plugin import`
+no longer executes a second copy (which re-installed every train patch). QURE_PLUGIN_DEDUP=0
+restores the legacy double import (see qure_plugin_mode.py).
 """
-import json
-import os
-import sys
+# F1 -- must stay the first statements of the module (qure_plugin_mode.dedup_module)
+try:
+    from swift_plugins.qure_plugin_mode import dedup_module as _dedup_module, once as _once
+except ImportError:  # repo root not on sys.path; swift put this plugin's own dir there
+    from qure_plugin_mode import dedup_module as _dedup_module, once as _once
+_dedup_module(__name__, 'mldecoder_joint_plugin')
+
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
 
 import torch
 import torch.nn as nn
@@ -423,6 +436,8 @@ class ASLwithClassWeight(nn.Module):
 # template: carry cls_labels from the sidecar through encode + collate
 # =========================================================================================
 def patch_template():
+    if not _once('mldecoder_joint_plugin.patch_template'):
+        return  # F1: already patched in this process
     from swift.template.templates.qwen import Qwen3_5Template
 
     orig_encode = Qwen3_5Template._encode
@@ -622,6 +637,8 @@ def patch_head_param_group():
     param_groups and keys off each group's `initial_lr`, so the group must exist before the
     scheduler is created or the head would silently follow the LLM's LR curve.
     """
+    if not _once('mldecoder_joint_plugin.patch_head_param_group'):
+        return  # F1: already patched in this process
     from swift.trainers.mixin import SwiftMixin
 
     orig = SwiftMixin.create_optimizer
@@ -662,6 +679,8 @@ def patch_head_param_group():
 
 def patch_step_probe():
     """Publish the optimizer step so the ASL weight schedule can read it."""
+    if not _once('mldecoder_joint_plugin.patch_step_probe'):
+        return  # F1: already patched in this process (a 2nd callback would double-log/eval)
     from transformers import TrainerCallback
     from swift.trainers.mixin import SwiftMixin
 
@@ -857,9 +876,13 @@ def patch_model_prepare():
     swift/pipelines/train/sft.py calls prepare_model at line 182 and builds the trainer at 189,
     so hooking prepare_model puts the head in the optimizer.
     """
+    if not _once('mldecoder_joint_plugin.patch_model_prepare'):
+        return  # F1: already patched in this process (a 2nd wrapper would attach 2 heads)
     from swift.pipelines.train.tuner import TunerMixin
 
-    orig = TunerMixin.prepare_model.__func__
+    # plain function or classmethod depending on what earlier plugins installed (F3-1: a plugin
+    # listed before this one may have replaced the classmethod with a plain function)
+    orig = getattr(TunerMixin.prepare_model, '__func__', TunerMixin.prepare_model)
 
     @classmethod
     def prepare_model(cls, args, model, **kwargs):
