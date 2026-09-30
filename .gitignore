@@ -154,3 +154,14 @@ megatron_output/
 
 # ast template
 ast_index_file.py
+
+# ---- local inference / analysis outputs (kept on node, never committed) ----
+vlm_inference_analysis/
+report_multiturn_140k/
+report_compare_20k/
+report_compare_nodule20k/
+eval140k_internvl/
+paper_vlm_release/
+data_qure/
+.gradio/
+examples/train/liger/_smoke_subset.jsonl

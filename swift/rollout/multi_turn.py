@@ -5,7 +5,10 @@ from abc import ABC
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union
 
-from swift.infer_engine import GRPOVllmEngine
+try:
+    from swift.infer_engine import GRPOVllmEngine
+except ImportError:  # vLLM is not installed in this env; used here only as a type annotation.
+    GRPOVllmEngine = None  # GRPO still runs with --use_vllm false (PyTorch rollouts).
 from swift.infer_engine.protocol import (ChatCompletionResponse, ChatCompletionResponseChoice, RequestConfig,
                                          RolloutInferRequest, RolloutOutput)
 from swift.template import Messages

@@ -200,6 +200,9 @@ class RequestConfig:
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
+    # Logprobs of these specific token ids at every position, regardless of their rank
+    # (i.e. not truncated by top_logprobs). Only supported by the sglang backend.
+    token_ids_logprob: Optional[List[int]] = None
 
     n: int = 1
     best_of: Optional[int] = None

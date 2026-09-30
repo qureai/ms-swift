@@ -124,6 +124,19 @@ class SglangEngine(InferEngine):
             engine_kwargs['pp_size'] = self.pp_size
         if 'enable_ep_moe' in parameters:
             engine_kwargs['enable_ep_moe'] = self.enable_ep_moe
+        # Env-gated passthrough for ServerArgs fields swift does not expose (e.g.
+        # mamba_scheduler_strategy, required for speculative decoding on hybrid models).
+        # SGLANG_EXTRA_SERVER_ARGS='{"mamba_scheduler_strategy": "extra_buffer"}'
+        extra = os.environ.get('SGLANG_EXTRA_SERVER_ARGS')
+        if extra:
+            import json as _json
+            for k, v in _json.loads(extra).items():
+                if k in parameters:
+                    engine_kwargs[k] = v
+                    logger.info(f'[sglang] extra server arg from env: {k}={v}')
+                else:
+                    logger.warning(f'[sglang] SGLANG_EXTRA_SERVER_ARGS key ignored '
+                                   f'(not a ServerArgs field): {k}')
         self.server_args = ServerArgs(
             model_path=self.model_dir,
             dtype=self.model_info.torch_dtype,
@@ -142,7 +155,7 @@ class SglangEngine(InferEngine):
             speculative_eagle_topk=self.speculative_eagle_topk,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             log_level=self.log_level,
-            skip_tokenizer_init=True,
+            skip_tokenizer_init=engine_kwargs.pop('skip_tokenizer_init', True),   # grammar backends need the tokenizer -> allow override via SGLANG_EXTRA_SERVER_ARGS
             trust_remote_code=True,
             **engine_kwargs,
         )
@@ -180,19 +193,73 @@ class SglangEngine(InferEngine):
         template_meta = self.template.template_meta
         stop_words = (request_config.stop or []) + (self.generation_config.get('stop') or []) + template_meta.stop_words
         generation_config['stop_token_ids'] = self._get_stop_token_ids(stop_words)
+        # structured outputs: pass sglang grammar constraints through when set on the request
+        # (json_schema / regex / ebnf as extra attributes, or the vLLM-style structured_outputs_regex field)
+        for k in ('json_schema', 'regex', 'ebnf'):
+            v = getattr(request_config, k, None)
+            if v: generation_config[k] = v
+        if getattr(request_config, 'structured_outputs_regex', None) and 'regex' not in generation_config:
+            generation_config['regex'] = request_config.structured_outputs_regex
 
-    def _create_chat_completion_response(self, output, inputs, return_details: bool = False):
+    @staticmethod
+    def _get_logprob_kwargs(request_config: RequestConfig) -> Dict[str, Any]:
+        """sglang takes the logprob switches as `async_generate` kwargs, not as sampling_params."""
+        if not request_config.logprobs and not request_config.token_ids_logprob:
+            return {}
+        kwargs = {'return_logprob': True}
+        if request_config.top_logprobs is not None:
+            kwargs['top_logprobs_num'] = request_config.top_logprobs
+        if request_config.token_ids_logprob:
+            kwargs['token_ids_logprob'] = list(request_config.token_ids_logprob)
+        return kwargs
+
+    def _get_sglang_logprobs(self, meta_info, token_ids: List[int],
+                            request_config: RequestConfig) -> Optional[Dict[str, Any]]:
+        """Convert sglang's meta_info logprobs into swift's OpenAI-style logprobs dict.
+
+        sglang returns `output_token_logprobs` as [(logprob, token_id, text), ...] and, when
+        `top_logprobs_num > 0`, `output_top_logprobs` as one such list per position. Swift's
+        `_get_logprobs` expects one {token_id: logprob} mapping per position instead.
+        """
+        token_logprobs = meta_info.get('output_token_logprobs')
+        if not token_logprobs:
+            return None
+        top_logprobs = meta_info.get('output_top_logprobs') or []
+        logprobs_list = []
+        for i, item in enumerate(token_logprobs):
+            logprob, token_id = item[0], item[1]
+            mapping = {top[1]: top[0] for top in top_logprobs[i]} if i < len(top_logprobs) else {}
+            # the sampled token is not guaranteed to be inside top-k; it always wins.
+            mapping[token_id] = logprob
+            logprobs_list.append(mapping)
+        res = self._get_logprobs(logprobs_list, token_ids, request_config.top_logprobs)
+        # `token_ids_logprob` entries are usually far outside top-k, so they get their own
+        # key rather than being merged into (and then truncated out of) `top_logprobs`.
+        requested = meta_info.get('output_token_ids_logprobs')
+        if res is not None and requested:
+            requested = requested[-len(res['content']):]
+            for pos, entry in zip(res['content'], requested):
+                pos['token_ids_logprobs'] = [{
+                    'token': self.tokenizer.decode(item[1]),
+                    'token_id': item[1],
+                    'logprob': item[0],
+                } for item in entry]
+        return res
+
+    def _create_chat_completion_response(self, output, inputs, request_config: RequestConfig):
         assert output is not None
+        return_details = request_config.return_details
         meta_info = output['meta_info']
         usage_info = self._get_usage_info(meta_info['prompt_tokens'], meta_info['completion_tokens'])
         response = self.template.decode(output['output_ids'], template_inputs=inputs['template_inputs'])
         toolcall = self._get_toolcall(response)
         token_ids = output['output_ids'] if return_details else None
+        logprobs = self._get_sglang_logprobs(meta_info, output['output_ids'], request_config)
         choice = ChatCompletionResponseChoice(
             index=0,
             message=ChatMessage(role='assistant', content=response, tool_calls=toolcall),
             finish_reason=meta_info['finish_reason']['type'],
-            logprobs=None,
+            logprobs=logprobs,
             token_ids=token_ids)
         prompt_token_ids = None
         images_size = None
@@ -261,24 +328,38 @@ class SglangEngine(InferEngine):
 
     async def _infer_full_async(self, inputs: Dict[str, Any], generation_config: Dict[str, Any],
                                 request_config: RequestConfig) -> ChatCompletionResponse:
-        engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
+        # sglang's async_generate expects `image_data`/`audio_data`/`video_data`, but swift's
+        # `inputs` carries `images`/`audios`/`videos` (as the embedding path above already remaps).
+        _media_key_map = {'images': 'image_data', 'audios': 'audio_data', 'videos': 'video_data'}
+        engine_inputs = {}
+        for k, v in inputs.items():
+            if k == 'template_inputs':
+                continue
+            engine_inputs[_media_key_map.get(k, k)] = v
+        engine_inputs.update(self._get_logprob_kwargs(request_config))
         output = await self.engine.async_generate(**engine_inputs, sampling_params=generation_config)
         output['prompt_token_ids'] = inputs['input_ids']
-        return self._create_chat_completion_response(output, inputs, request_config.return_details)
+        return self._create_chat_completion_response(output, inputs, request_config)
 
     async def _infer_stream_async(self, inputs: Dict[str, Any], generation_config: Dict[str, Any],
-                                  **kwargs) -> AsyncIterator[ChatCompletionStreamResponse]:
+                                  request_config: RequestConfig, **kwargs) -> AsyncIterator[
+                                      ChatCompletionStreamResponse]:
         engine_inputs = {k: v for k, v in inputs.items() if k != 'template_inputs'}
+        engine_inputs.update(self._get_logprob_kwargs(request_config))
         result_generator = await self.engine.async_generate(
             **engine_inputs, sampling_params=generation_config, stream=True)
         infer_streamer = InferStreamer(self.template, template_inputs=inputs['template_inputs'])
+        # sglang streams cumulative output_ids/logprobs; only the new tokens belong in each chunk.
+        num_emitted = 0
         async for output in result_generator:
-            res = self._create_chat_completion_stream_response(output, infer_streamer)
+            res = self._create_chat_completion_stream_response(output, infer_streamer, request_config, num_emitted)
+            num_emitted = len(output['output_ids'])
             if res is None:
                 continue
             yield res
 
-    def _create_chat_completion_stream_response(self, output, infer_streamer) -> Optional[ChatCompletionStreamResponse]:
+    def _create_chat_completion_stream_response(self, output, infer_streamer, request_config: RequestConfig,
+                                                num_emitted: int = 0) -> Optional[ChatCompletionStreamResponse]:
         assert output is not None
         meta_info = output['meta_info']
         finish_reason = meta_info['finish_reason']
@@ -292,10 +373,10 @@ class SglangEngine(InferEngine):
             toolcall = self._get_toolcall(self.template.decode(output['output_ids'], **infer_streamer.decode_kwargs))
         meta_info = output['meta_info']
         usage_info = self._get_usage_info(meta_info['prompt_tokens'], meta_info['completion_tokens'])
-        # TODO: logprobs
+        logprobs = self._get_sglang_logprobs(meta_info, output['output_ids'][num_emitted:], request_config)
         choice = ChatCompletionResponseStreamChoice(
             index=0,
             delta=DeltaMessage(role='assistant', content=delta_text, tool_calls=toolcall),
             finish_reason=finish_reason,
-            logprobs=None)
+            logprobs=logprobs)
         return ChatCompletionStreamResponse(model=self.model_name, choices=[choice], usage=usage_info)
