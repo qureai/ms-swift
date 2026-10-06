@@ -1,0 +1,882 @@
+#!/usr/bin/env python
+"""Joint training plugin: Qwen3.5 vision encoder + ML-Decoder head, ASL + AR loss.
+
+Load with:
+    --external_plugins swift_plugins/mldecoder_joint_plugin.py
+    --packing false --padding_free false          # REQUIRED, see PACKING below
+    --use_liger_kernel true                       # keep it on; see attach_head()
+Do NOT pass --loss_type: the ASL term is folded into the model's own loss inside forward(),
+because a custom compute_loss_func makes transformers pop `labels` and materialize the full
+logits tensor (~10 GB for a 20k-token sequence), which OOMs and disables Liger's fused CE.
+
+Architecture -- MLP and LLM are untouched. Only an ML-Decoder classification head is added on
+top of the existing vision tower:
+
+    pixel_values -> model.visual -> BaseModelOutputWithPooling(
+                                       last_hidden_state,   # (S, 1024)   pre-merger ViT
+                                       pooler_output)       # (S/4, 2048) post-merger
+                     |                       |
+                     |                       +-> scattered into inputs_embeds -> LLM (unchanged)
+                     v
+       both taps concatenated -> MLDecoder -> logits (n_images, 132)
+
+FEATURE TAP. `Qwen3_5VisionModel.forward` already returns both taps, so no surgery inside the
+tower is needed -- a forward hook on `model.visual` sees both. The concat is exact rather than
+heuristic: `Qwen3_5VisionPatchMerger.hidden_size = hidden_size * spatial_merge_size**2`
+(1024*4 = 4096) and its forward does `x.view(-1, 4096)`, so post-merger token i is precisely
+pre-merger tokens 4i..4i+3. Grouping the pre-merger tokens the same way aligns the two taps
+token-for-token, giving 4*1024 + 2048 = 6144 features per position.
+
+PACKING. Packing concatenates several conversations into one sequence, which breaks the
+image->row correspondence the per-row label vector depends on. This plugin asserts packing is
+off rather than silently mislabelling.
+
+MULTI-IMAGE ROWS. Some rows carry 2 images (comparison prompts). The label vector is per-row,
+so it is repeated for each image of that row: every image is trained toward its row's labels.
+For comparison pairs that is an approximation, and it is deliberate -- the alternative
+(dropping those rows) would lose the comparison data entirely.
+
+LOSS WEIGHTS. total = AR_WEIGHT*ar + ASL_WEIGHT*asl, both settable by env var. They are
+weighted separately because the reductions differ: AR is a per-token mean (0.1-0.4), ASL is a
+sum over 132 classes (6-11). Defaults 1.0 / 0.03 put the weighted terms at parity.
+
+ASL. Re-implemented from foundation_model_accelerate/loss/classification_loss.py
+(`ASLwithClassWeight`, gamma_neg=8, gamma_pos=1, clip=0.05, pos_weights=exp(1-p),
+neg_weights=exp(p)) with two deliberate changes: weights live on the module as buffers instead
+of a hardcoded `.cuda()` (which breaks under deepspeed/device_map), and the loss is reduced
+here instead of returning an un-reduced tensor.
+"""
+import json
+import os
+import sys
+
+import torch
+import torch.nn as nn
+
+from swift.utils import get_logger
+
+logger = get_logger()
+
+# --- where to find the ML-Decoder implementation -------------------------------------------
+FM_REPO = os.environ.get(
+    'FM_ACCELERATE_REPO',
+    '/fastdata4/sahil_work/VLM_qure/vision_foundation_2d/foundation_model_accelerate')
+SIDECAR = os.environ.get(
+    'CLS_LABEL_SIDECAR',
+    '/fastdata4/sahil_work/VLM_qure/data_preparation/training_data/cls_label_sidecar')
+# total = AR_WEIGHT * ar_loss + ASL_WEIGHT * asl
+#
+# The two terms are NOT on the same scale, so both weights are explicit rather than one being
+# an implicit 1.0. AR is a mean over tokens (0.1-0.4 for a trained model, and independent of
+# sequence length). ASL is a SUM over 132 classes then a mean over samples, so it lands at
+# 6-11 -- roughly 20-40x larger, purely from the reduction. Measured: at ASL_WEIGHT=1.0 the
+# loss is ~97% classification and grad_norm runs 260-510 against a usual 4-8.
+# ASL_WEIGHT=0.03 puts the two weighted terms at parity (~0.3 each); raise it toward 0.1 to
+# let the freshly-initialized head lead early.
+AR_WEIGHT = float(os.environ.get('AR_WEIGHT', '1.0'))
+# ASL weight SCHEDULE: start high so the randomly-initialized head learns fast, decay to a
+# steady value so the LM objective is not permanently dominated, then hold constant.
+#   weight(step) = END + (START-END) * f(step / DECAY_STEPS)   for step < DECAY_STEPS
+#                = END                                          afterwards
+# Set ASL_WEIGHT to pin a constant weight and bypass the schedule entirely.
+ASL_WEIGHT_START = float(os.environ.get('ASL_WEIGHT_START', '1.0'))
+ASL_WEIGHT_END = float(os.environ.get('ASL_WEIGHT_END', '0.03'))
+ASL_DECAY_STEPS = int(os.environ.get('ASL_DECAY_STEPS', '1000'))
+ASL_DECAY_SHAPE = os.environ.get('ASL_DECAY_SHAPE', 'cosine')  # cosine | linear | exp
+_ASL_CONST = os.environ.get('ASL_WEIGHT')
+ASL_WEIGHT = float(_ASL_CONST) if _ASL_CONST is not None else None
+
+# Optimizer step, published by a TrainerCallback. A forward-hook counter would be wrong: the
+# hook fires once per MICRO-batch, so it over-counts by gradient_accumulation_steps.
+_SCHED = {'step': 0, 'total': None}
+# per-eval accumulators for the val AUC, and running train means for wandb
+# `keys` are per-row study basenames, aligned to logits/labels rows, so saved predictions tie
+# back to individual studies. Directory for the step-wise dumps (set MLD_EVAL_PRED_DIR to move).
+_EVAL = {'logits': [], 'labels': [], 'keys': []}
+EVAL_PRED_DIR = os.environ.get('MLD_EVAL_PRED_DIR')  # default set in patch, once output_dir known
+# LM-side AUC: presence true/false logprobs read out of the classification JSON itself,
+# per ontology tag. Separate from the ML-Decoder head's AUC -- different tag vocabulary
+# (only 38 of the 132 cls-token tags also appear as ontology finding names).
+_LM = {'score': [], 'label': [], 'tag': [],
+       '_saved_score': None, '_saved_label': None, '_saved_tag': None}
+_TOK = {'tok': None}
+# every single-token spelling of the presence value (ids resolved lazily from the tokenizer)
+_TF = {'true': None, 'false': None}
+_RUN = {'ar': 0.0, 'asl': 0.0, 'n': 0}
+
+
+def current_asl_weight():
+    if ASL_WEIGHT is not None:
+        return ASL_WEIGHT
+    if ASL_DECAY_STEPS <= 0 or ASL_WEIGHT_START == ASL_WEIGHT_END:
+        return ASL_WEIGHT_END
+    step = _SCHED['step']
+    if step >= ASL_DECAY_STEPS:
+        return ASL_WEIGHT_END
+    t = step / ASL_DECAY_STEPS
+    if ASL_DECAY_SHAPE == 'linear':
+        f = 1.0 - t
+    elif ASL_DECAY_SHAPE == 'exp':
+        # geometric interpolation START -> END
+        import math as _m
+        return ASL_WEIGHT_START * (ASL_WEIGHT_END / ASL_WEIGHT_START) ** t
+    else:
+        import math as _m
+        f = 0.5 * (1.0 + _m.cos(_m.pi * t))
+    return ASL_WEIGHT_END + (ASL_WEIGHT_START - ASL_WEIGHT_END) * f
+DECODER_EMBEDDING = int(os.environ.get('MLD_DECODER_EMBEDDING', '768'))
+NUM_OF_GROUPS = int(os.environ.get('MLD_NUM_OF_GROUPS', '-1'))
+# bf16 everywhere, matching --torch_dtype bfloat16 for the base model
+HEAD_DTYPE = getattr(torch, os.environ.get('MLD_HEAD_DTYPE', 'bfloat16'))
+# The head is randomly initialized, so it needs a far larger LR than the converged backbone.
+# swift exposes --learning_rate / --vit_lr / --aligner_lr but has NO flag for this head, so it
+# would otherwise sit in the default group at the LLM's LR and barely move.
+HEAD_LR = float(os.environ.get('MLD_HEAD_LR', '5e-4'))
+
+if FM_REPO not in sys.path:
+    sys.path.insert(0, FM_REPO)
+try:
+    from nnmodule.models.ml_decoder import MLDecoder
+except Exception as e:  # pragma: no cover
+    raise ImportError(
+        f'Could not import MLDecoder from {FM_REPO}. Set FM_ACCELERATE_REPO to the '
+        f'foundation_model_accelerate checkout. Original error: {e}') from e
+
+
+# =========================================================================================
+# label sidecar
+# =========================================================================================
+class LabelTable:
+    """image path -> 132-dim float vector, via the hybrid key (see build_cls_label_sidecar.py)."""
+
+    def __init__(self, sidecar_dir):
+        import pandas as pd
+        meta = json.load(open(f'{sidecar_dir}/tags.json'))
+        self.tags = meta['tags']
+        self.num_classes = meta['num_classes']
+        self.class_instance_nums = torch.tensor(meta['class_instance_nums'], dtype=torch.float)
+        self.total_instance_num = float(meta['total_instance_num'])
+        df = pd.read_parquet(f'{sidecar_dir}/labels.parquet')
+        self.table = {k: v for k, v in zip(df['key'].tolist(), df['labels'].tolist())}
+        logger.info(f'[mldecoder] label sidecar: {len(self.table):,} keys · '
+                    f'{self.num_classes} classes')
+
+    def get(self, path):
+        if not path:
+            return None
+        parts = str(path).strip('/').split('/')
+        v = self.table.get(os.path.basename(str(path)))
+        if v is None:
+            v = self.table.get('/'.join(parts[-3:]))
+        return None if v is None else torch.tensor(v, dtype=torch.float)
+
+
+MLD_DEBUG = os.environ.get('MLD_DEBUG', '0') == '1'
+LOG_EVERY = max(int(os.environ.get('MLD_LOG_EVERY', '20')), 1)
+_DBG_SEEN = {}
+
+
+def _dbg(tag):
+    """Log each distinct stage tag only the first few times (MLD_DEBUG=1)."""
+    if not MLD_DEBUG:
+        return
+    n = _DBG_SEEN.get(tag, 0)
+    if n < 3:
+        _DBG_SEEN[tag] = n + 1
+        logger.info(f'[mldecoder][dbg] {tag}')
+
+
+_LABELS = None
+
+
+def get_label_table():
+    global _LABELS
+    if _LABELS is None:
+        _LABELS = LabelTable(SIDECAR)
+    return _LABELS
+
+
+# =========================================================================================
+# the head, attached to the vision tower
+# =========================================================================================
+class VisionMLDecoderHead(nn.Module):
+    """MLDecoder over the concatenated pre/post-merger vision features of each image."""
+
+    def __init__(self, num_classes, vis_hidden, out_hidden, spatial_merge_size,
+                 decoder_embedding=768, num_of_groups=-1):
+        super().__init__()
+        self.merge_sq = spatial_merge_size ** 2
+        self.in_features = vis_hidden * self.merge_sq + out_hidden
+        self.ml_decoder = MLDecoder(
+            num_classes=num_classes,
+            num_of_groups=num_of_groups,
+            decoder_embedding=decoder_embedding,
+            initial_num_features=self.in_features,
+        )
+        logger.info(f'[mldecoder] head: in_features={self.in_features} '
+                    f'({vis_hidden}*{self.merge_sq} pre + {out_hidden} post) '
+                    f'-> {num_classes} classes')
+
+    def forward(self, pre, post, grid_thw):
+        """pre (S, vis_hidden) · post (S/merge_sq, out_hidden) · grid_thw (n_img, 3)."""
+        pre = pre.to(HEAD_DTYPE)
+        post = post.to(HEAD_DTYPE)
+        seqs = []
+        pre_off = post_off = 0
+        for t, h, w in grid_thw.tolist():
+            n_pre = int(t * h * w)
+            n_post = n_pre // self.merge_sq
+            p = pre[pre_off:pre_off + n_pre].reshape(n_post, self.merge_sq * pre.shape[-1])
+            q = post[post_off:post_off + n_post]
+            seqs.append(torch.cat([p, q], dim=-1))
+            pre_off += n_pre
+            post_off += n_post
+        n_tok = max(s.shape[0] for s in seqs)
+        bs = len(seqs)
+        x = seqs[0].new_zeros(bs, n_tok, self.in_features)
+        # True == ignore, matching nn.MultiheadAttention's key_padding_mask convention
+        mask = torch.ones(bs, n_tok, dtype=torch.bool, device=x.device)
+        for i, s in enumerate(seqs):
+            x[i, :s.shape[0]] = s
+            mask[i, :s.shape[0]] = False
+        # bf16 end to end, matching the rest of the model. The original pipeline forced fp32
+        # here; under --deepspeed zero2 + bf16 that dies with "mat1 and mat2 must have the
+        # same dtype" (a single-GPU run without deepspeed keeps the head fp32 and hides it).
+        return self.ml_decoder(x.to(HEAD_DTYPE), mask=mask, honor_mask=True)
+
+
+def attach_head(model):
+    """Add the head, hook the vision tower, and fold ASL into the model's own loss. Idempotent.
+
+    WHY THE ASL TERM IS ADDED INSIDE forward() AND NOT VIA --loss_type:
+    transformers' Trainer.compute_loss POPS `labels` from the inputs whenever
+    `compute_loss_func` is set, so the model never computes its loss internally. That forces
+    `outputs.logits` to be materialized in full -- for a 20k-token sequence over a ~250k
+    vocabulary that is ~10 GB in bf16 -- and it bypasses the fused Liger cross-entropy that
+    `--use_liger_kernel` exists to provide. The first smoke run OOMed in accelerate's
+    `_convert_to_fp32` for exactly this reason. Adding the ASL term to `outputs.loss` here
+    keeps labels in the inputs, so Liger's fused CE still runs and no full logits tensor is
+    ever allocated.
+    """
+    if getattr(model, '_mldecoder_attached', False):
+        return model
+    visual = getattr(model, 'visual', None)
+    if visual is None:
+        raise RuntimeError('model has no `.visual` vision tower; expected Qwen3.5-VL')
+    vcfg = model.config.vision_config
+    tbl = get_label_table()
+    device = next(model.parameters()).device
+    head = VisionMLDecoderHead(
+        num_classes=tbl.num_classes,
+        vis_hidden=vcfg.hidden_size,
+        out_hidden=vcfg.out_hidden_size,
+        spatial_merge_size=vcfg.spatial_merge_size,
+        decoder_embedding=DECODER_EMBEDDING,
+        num_of_groups=NUM_OF_GROUPS,
+    ).to(device=device, dtype=HEAD_DTYPE)
+    model.ml_decoder_head = head
+    model.asl_loss = ASLwithClassWeight(
+        tbl.class_instance_nums, tbl.total_instance_num).to(device=device, dtype=HEAD_DTYPE)
+
+    def hook(module, args, kwargs, output):
+        # grid_thw is the 2nd positional arg of Qwen3_5VisionModel.forward
+        grid_thw = kwargs.get('grid_thw')
+        if grid_thw is None and len(args) >= 2:
+            grid_thw = args[1]
+        if grid_thw is None or not hasattr(output, 'last_hidden_state'):
+            return output
+        model._cls_logits = head(output.last_hidden_state, output.pooler_output, grid_thw)
+        return output
+
+    visual.register_forward_hook(hook, with_kwargs=True)
+
+    state = {'step': 0, 'warned': False, 'ar': 0.0, 'asl': 0.0, 'lm_warned': False}
+
+    def loss_hook(module, args, kwargs, out):
+        """Add the ASL term to the model's own loss.
+
+        Registered as a forward HOOK rather than by overriding `model.forward`: transformers
+        applies Liger to the model INSTANCE inside Trainer.__init__, which runs after
+        prepare_model and silently replaces an instance-level `forward` attribute. An
+        instrumented run confirmed the override never executed. Hooks live in `_forward_hooks`
+        and are invoked by nn.Module._call_impl, so they survive that reassignment.
+        """
+        logits = module.__dict__.pop('_cls_logits', None)
+        labels = module.__dict__.pop('_cls_labels', None)
+        loss = getattr(out, 'loss', None)
+        _dbg(f'losshook logits={logits is not None} labels={labels is not None} '
+             f'loss={loss is not None}')
+        if logits is None or labels is None or loss is None:
+            if logits is not None and labels is None and not state['warned']:
+                logger.warning('[mldecoder] vision features but no cls_labels — ASL skipped.')
+                state['warned'] = True
+            return out
+        labels = labels.to(logits.device)
+        mask = module.__dict__.pop('_cls_mask', None)
+        if mask is not None and mask.shape[0] == logits.shape[0] and int(mask.sum()) == labels.shape[0]:
+            logits = logits[mask.to(logits.device)]          # keep only images that have a label
+        if labels.shape[0] != logits.shape[0]:
+            if not state['warned']:
+                logger.warning(f'[mldecoder] label/logit row mismatch {tuple(labels.shape)} vs '
+                               f'{tuple(logits.shape)} — ASL skipped (is packing on?)')
+                state['warned'] = True
+            return out
+        keys = module.__dict__.pop('_cls_keys', None)
+        if not module.training:
+            # eval pass: stash for the AUC computation in on_evaluate
+            _EVAL['logits'].append(logits.detach().float().cpu())
+            _EVAL['labels'].append(labels.detach().float().cpu())
+            # keep keys row-aligned; pad with None if this batch had none so lengths still match
+            n = logits.shape[0]
+            if keys is not None and len(keys) == n:
+                _EVAL['keys'].extend(keys)
+            else:
+                _EVAL['keys'].extend([None] * n)
+            lm_logits = getattr(out, 'logits', None)
+            lm_labels = kwargs.get('labels')
+            tok = _TOK['tok']
+            if lm_logits is not None and lm_labels is not None and tok is not None:
+                try:
+                    _collect_lm_presence(lm_logits.detach().float(), lm_labels.detach(), tok,
+                                         _TOK['ontology'])
+                except Exception as e:
+                    if not state.get('lm_warned'):
+                        logger.warning(f'[mldecoder] LM presence collection failed: '
+                                       f'{type(e).__name__}: {e}')
+                        state['lm_warned'] = True
+            elif lm_logits is None and not state.get('lm_warned'):
+                logger.warning('[mldecoder] eval produced no LM logits (fused CE keeps them '
+                               'unmaterialized) — the JSON-logprob AUC cannot be computed. '
+                               'The ML-Decoder AUC is unaffected.')
+                state['lm_warned'] = True
+        asl = module.asl_loss(logits, labels)
+        w = current_asl_weight()
+        ar_t = AR_WEIGHT * loss
+        asl_t = w * asl
+        state['step'] += 1
+        state['ar'] += float(loss.detach())
+        state['asl'] += float(asl.detach())
+        if module.training:
+            _RUN['ar'] += float(loss.detach())
+            _RUN['asl'] += float(asl.detach())
+            _RUN['n'] += 1
+        if (state['step'] - 1) % LOG_EVERY == 0:
+            a, b = float(ar_t.detach()), float(asl_t.detach())
+            share = 100 * b / max(a + b, 1e-9)
+            logger.info(f'[mldecoder] step={_SCHED["step"]} w_asl={w:.4f} | raw '
+                        f'ar={float(loss.detach()):.4f} asl={float(asl.detach()):.4f} | weighted '
+                        f'{AR_WEIGHT}*ar={a:.4f} {w:.4f}*asl={b:.4f} | asl {share:.0f}% of total')
+            if _SCHED['step'] > ASL_DECAY_STEPS and (share > 90 or share < 5):
+                logger.warning(f'[mldecoder] ASL is {share:.0f}% of the loss — one term is '
+                               f'dominating. Retune ASL_WEIGHT (parity is ~0.03).')
+        out.loss = ar_t + asl_t
+        return out
+
+    model.register_forward_hook(loss_hook, with_kwargs=True)
+    model._mldecoder_attached = True
+    _w = f'{ASL_WEIGHT}' if ASL_WEIGHT is not None else \
+         f'[{ASL_WEIGHT_START}->{ASL_WEIGHT_END} over {ASL_DECAY_STEPS} steps]'
+    logger.info(f'[mldecoder] head attached · hooks registered · loss = {AR_WEIGHT}*ar + {_w}*asl')
+    return model
+
+
+# =========================================================================================
+# ASL + AR loss
+# =========================================================================================
+class ASLwithClassWeight(nn.Module):
+    """Asymmetric loss with per-class frequency weighting. See module docstring for the source."""
+
+    def __init__(self, class_instance_nums, total_instance_num, gamma_neg=8, gamma_pos=1,
+                 clip=0.05, eps=1e-8):
+        super().__init__()
+        p = class_instance_nums / max(total_instance_num, 1.0)
+        self.register_buffer('pos_weights', torch.exp(1 - p))
+        self.register_buffer('neg_weights', torch.exp(p))
+        self.gamma_neg, self.gamma_pos, self.clip, self.eps = gamma_neg, gamma_pos, clip, eps
+
+    def forward(self, pred, label):
+        # bf16 end to end, including this reduction. Verified finite across the full logit
+        # range the head can produce (random init, prior-matched, and confidently-wrong, where
+        # the (1-pt)**8 focusing term is largest). bf16 has ~3 decimal digits of mantissa, so
+        # the loss VALUE is coarser than fp32 -- expect ~2-3 significant figures in the logged
+        # asl number. That affects readability, not the gradient direction.
+        pred = pred.to(HEAD_DTYPE)
+        label = label.to(HEAD_DTYPE)
+        weight = label * self.pos_weights + (1 - label) * self.neg_weights
+        xs_pos = torch.sigmoid(pred)
+        xs_neg = 1.0 - xs_pos
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
+        los_pos = label * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1 - label) * torch.log(xs_neg.clamp(min=self.eps))
+        loss = (los_pos + los_neg) * weight
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            pt = xs_pos * label + xs_neg * (1 - label)
+            one_sided_gamma = self.gamma_pos * label + self.gamma_neg * (1 - label)
+            loss = loss * torch.pow(1 - pt, one_sided_gamma)
+        return -loss.sum(dim=-1).mean()
+
+
+
+
+# =========================================================================================
+# template: carry cls_labels from the sidecar through encode + collate
+# =========================================================================================
+def patch_template():
+    from swift.template.templates.qwen import Qwen3_5Template
+
+    orig_encode = Qwen3_5Template._encode
+    orig_collator = Qwen3_5Template._data_collator
+    orig_post_encode = Qwen3_5Template._post_encode
+    orig_encode_public = Qwen3_5Template.encode
+
+    def encode(self, inputs, *args, **kwargs):
+        """Look the labels up from the RAW ROW DICT, which still holds the original path.
+
+        Neither `_encode` nor `_preprocess_inputs` works for this: by the time either runs,
+        `inputs.images` holds loaded PIL objects, not path strings (see
+        swift/template/base.py:382-384 and StdTemplateInputs construction). An instrumented run
+        confirmed `_preprocess_inputs` sees zero str entries -- which is how the earlier smoke
+        runs trained with NO ASL term and no warning at all. `encode()` is the outermost entry
+        point and `EncodePreprocessor.preprocess` (swift/dataset/utils.py:122) hands it the raw
+        row, where `image` / `images` are still the paths written by the data builder.
+
+        `*args` matters: the INFERENCE path calls `encode(inputs, return_template_inputs)`
+        positionally, so a (self, inputs, **kwargs) signature raises
+        "takes 2 positional arguments but 3 were given" and kills the run. swift restores
+        `external_plugins` from the checkpoint's args.json, so this training plugin is loaded
+        during `swift infer` whether or not the infer script asks for it.
+        """
+        def _path_of(x):
+            # HF datasets' Image feature yields {'bytes': ..., 'path': '...'}, not a bare str
+            if isinstance(x, str):
+                return x
+            if isinstance(x, dict):
+                return x.get('path')
+            return getattr(x, 'filename', None)
+
+        paths = []
+        if isinstance(inputs, dict):
+            v = inputs.get('images') or inputs.get('image')
+            cand = [v] if not isinstance(v, (list, tuple)) else list(v)
+            paths = [q for q in (_path_of(x) for x in cand) if isinstance(q, str)]
+        tbl = get_label_table()
+        # keep keys aligned with labels: only rows whose label lookup succeeds are kept, and the
+        # study basename for exactly those rows is carried alongside so a saved prediction row
+        # maps back to its study.
+        pairs = [(os.path.basename(str(p)), tbl.get(p)) for p in paths]
+        vecs = [v for _, v in pairs if v is not None]
+        self._pending_cls_labels = torch.stack(vecs) if vecs else None
+        self._pending_cls_keys = [k for k, v in pairs if v is not None] if vecs else None
+        # ROW MASK (stage 6): one bool per IMAGE, in image order. Rows whose image has no sidecar
+        # label (internal bbox data) still produce head logits; the loss hook selects
+        # logits[mask] so labelled and unlabelled rows can share a batch instead of the whole
+        # batch's ASL being skipped on a shape mismatch.
+        self._pending_cls_mask = torch.tensor([v is not None for _, v in pairs], dtype=torch.bool) if paths else None
+        _dbg(f'encode_row_paths={len(paths)} labels={len(vecs)}')
+        return orig_encode_public(self, inputs, *args, **kwargs)
+
+    def _encode(self, inputs):
+        encoded = orig_encode(self, inputs)
+        pending = getattr(self, '_pending_cls_labels', None)
+        if pending is not None:
+            encoded['cls_labels'] = pending
+            # a single row here holds a list of keys (this example's images); carry as-is
+            encoded['cls_key'] = getattr(self, '_pending_cls_keys', None)
+            _dbg('encode_attached')
+        pm = getattr(self, '_pending_cls_mask', None)
+        if pm is not None:
+            encoded['cls_mask'] = pm
+        self._pending_cls_labels = None
+        self._pending_cls_keys = None
+        self._pending_cls_mask = None
+        return encoded
+
+    def _data_collator(self, batch, *, padding_to=None):
+        res = orig_collator(self, batch, padding_to=padding_to)
+        vecs = [b['cls_labels'] for b in batch if b.get('cls_labels') is not None]
+        _dbg(f'collator_saw={len(vecs)}/{len(batch)}')
+        if vecs:
+            vecs = [v if isinstance(v, torch.Tensor) else torch.as_tensor(v, dtype=torch.float)
+                    for v in vecs]
+            vecs = [v.unsqueeze(0) if v.dim() == 1 else v for v in vecs]
+            res['cls_labels'] = torch.cat(vecs, dim=0)
+            # flatten the per-example key lists in the SAME order the label rows were concatenated
+            keys = []
+            for b in batch:
+                if b.get('cls_labels') is not None:
+                    k = b.get('cls_key')
+                    keys.extend(k if isinstance(k, (list, tuple)) else [k])
+            res['cls_key'] = keys
+        masks = [b['cls_mask'] for b in batch if b.get('cls_mask') is not None]
+        if masks:
+            res['cls_mask'] = torch.cat([m if m.dim() == 1 else m.view(-1) for m in masks], dim=0)
+        return res
+
+    def _post_encode(self, model, inputs):
+        # stash the batch's labels/keys on the model so the loss can reach them, then drop the
+        # keys (the LLM forward would reject unexpected kwargs)
+        cls_labels = inputs.pop('cls_labels', None)
+        cls_key = inputs.pop('cls_key', None)
+        cls_mask = inputs.pop('cls_mask', None)
+        base = model.module if hasattr(model, 'module') else model
+        _dbg('post_encode_stashed' if cls_labels is not None else 'post_encode_missing')
+        if cls_labels is not None:
+            base._cls_labels = cls_labels
+            base._cls_keys = cls_key
+        if cls_mask is not None:
+            base._cls_mask = cls_mask
+        return orig_post_encode(self, model, inputs)
+
+    Qwen3_5Template.encode = encode
+    Qwen3_5Template._encode = _encode
+    Qwen3_5Template._data_collator = _data_collator
+    Qwen3_5Template._post_encode = _post_encode
+    logger.info('[mldecoder] Qwen3_5Template patched (cls_labels encode/collate/stash)')
+
+
+def _resolve_tf_ids(tok):
+    """Token ids for the true/false spellings; the value is preceded by a space in the JSON."""
+    if _TF['true'] is not None:
+        return _TF['true'], _TF['false']
+    t, f = set(), set()
+    for s_, bucket in ((' true', t), ('true', t), (' True', t), ('True', t),
+                       (' false', f), ('false', f), (' False', f), ('False', f)):
+        ids = tok.encode(s_, add_special_tokens=False)
+        if len(ids) == 1:
+            bucket.add(ids[0])
+    _TF['true'], _TF['false'] = sorted(t), sorted(f)
+    logger.info(f'[mldecoder] presence token ids · true={_TF["true"]} false={_TF["false"]}')
+    return _TF['true'], _TF['false']
+
+
+_NAME_RE = None
+
+
+def _collect_lm_presence(logits, lm_labels, tok, ontology):
+    """Read (tag, score, label) at every `"presence": true|false` slot of the target.
+
+    score = logit_true - logit_false at the position that PREDICTS the value token. The
+    softmax denominator is shared, so the logit difference equals log p(true) - log p(false)
+    exactly -- no need to materialize probabilities.
+
+    Causal-LM alignment: logits[t-1] predicts labels[t], hence the t-1 index.
+    """
+    global _NAME_RE
+    if _NAME_RE is None:
+        import re as _re
+        _NAME_RE = _re.compile(r'"([A-Za-z0-9_]+)"\s*:\s*\{')
+    true_ids, false_ids = _resolve_tf_ids(tok)
+    tf = set(true_ids) | set(false_ids)
+    B, T, _ = logits.shape
+    for b in range(B):
+        lab = lm_labels[b]
+        pos = (lab.unsqueeze(-1) == lab.new_tensor(sorted(tf))).any(-1).nonzero().flatten()
+        for t in pos.tolist():
+            if t == 0:
+                continue
+            row = logits[b, t - 1]
+            lt = max(float(row[i]) for i in true_ids)
+            lf = max(float(row[i]) for i in false_ids)
+            # the finding name is the last `"name": {` before this presence value
+            win = lab[max(0, t - 48):t]
+            win = win[win >= 0]
+            if win.numel() == 0:
+                continue
+            names = _NAME_RE.findall(tok.decode(win.tolist()))
+            if not names:
+                continue
+            tag = names[-1]
+            if tag not in ontology:
+                continue
+            _LM['score'].append(lt - lf)
+            _LM['label'].append(1 if int(lab[t]) in set(true_ids) else 0)
+            _LM['tag'].append(tag)
+
+
+def _per_tag_auc(logits, labels, tags):
+    """{tag: auc} for tags with BOTH classes present, plus macro/mean-AP summaries.
+
+    Tags that are all-positive or all-negative in the eval set have no defined AUC and are
+    skipped rather than silently scored 0.5 -- with prevalences down to 0.03% many rare tags
+    will have no positives in a small val split, and averaging them in would drag the macro
+    toward chance for reasons unrelated to the model.
+    """
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    out, aps, skipped = {}, {}, 0
+    for i, tag in enumerate(tags):
+        y = labels[:, i]
+        n_pos = int(y.sum())
+        if n_pos == 0 or n_pos == len(y):
+            skipped += 1
+            continue
+        out[tag] = float(roc_auc_score(y, logits[:, i]))
+        aps[tag] = float(average_precision_score(y, logits[:, i]))
+    return out, aps, skipped
+
+
+def patch_head_param_group():
+    """Give the ML-Decoder head its own optimizer param group at HEAD_LR.
+
+    Patched at create_optimizer (not later): the LR scheduler is built from the optimizer's
+    param_groups and keys off each group's `initial_lr`, so the group must exist before the
+    scheduler is created or the head would silently follow the LLM's LR curve.
+    """
+    from swift.trainers.mixin import SwiftMixin
+
+    orig = SwiftMixin.create_optimizer
+
+    def create_optimizer(self, model=None):
+        opt = orig(self, model=model)
+        m = self.model
+        base = m.module if hasattr(m, 'module') else m
+        head = getattr(base, 'ml_decoder_head', None)
+        if opt is None or head is None:
+            return opt
+
+        # THE FIX. swift's create_optimizer builds param groups by NAME PREFIX (vit / aligner /
+        # llm); `ml_decoder_head.*` matches none of them, so the head params are never in the
+        # optimizer to begin with. The previous version tried to *move* them between existing
+        # groups and found nothing to move -- so the head got zero optimizer state and never
+        # updated (verified: all 132 head tensors bit-identical across checkpoints). We instead
+        # ADD the head as a fresh group. Guard on identity so a param already present (e.g. if a
+        # future swift version does include it) is not double-registered.
+        in_opt = {id(p) for g in opt.param_groups for p in g['params']}
+        head_params = [p for p in head.parameters()
+                       if p.requires_grad and id(p) not in in_opt]
+        if head_params:
+            n = sum(p.numel() for p in head_params)
+            opt.add_param_group({'params': head_params, 'lr': HEAD_LR,
+                                 'initial_lr': HEAD_LR, 'weight_decay': 0.0})
+            logger.info(f'[mldecoder] head param group ADDED: {len(head_params)} tensors '
+                        f'({n:,} params) at lr={HEAD_LR}. The head now trains.')
+        else:
+            already = sum(p.numel() for p in head.parameters() if id(p) in in_opt)
+            logger.warning('[mldecoder] no new head params to add '
+                           f'({already:,} already in the optimizer). Head LR may not be {HEAD_LR}.')
+        return opt
+
+    SwiftMixin.create_optimizer = create_optimizer
+    logger.info(f'[mldecoder] create_optimizer patched for head lr={HEAD_LR}')
+
+
+def patch_step_probe():
+    """Publish the optimizer step so the ASL weight schedule can read it."""
+    from transformers import TrainerCallback
+    from swift.trainers.mixin import SwiftMixin
+
+    class _StepProbe(TrainerCallback):
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            _SCHED['total'] = state.max_steps
+            tr = getattr(self, '_trainer', None)
+            tok = getattr(tr, 'processing_class', None) or getattr(tr, 'tokenizer', None)
+            tok = getattr(tok, 'tokenizer', tok)
+            _TOK['tok'] = tok
+            try:
+                _TOK['ontology'] = set(json.load(open(f'{SIDECAR}/ontology_tags.json')))
+                logger.info(f'[mldecoder] JSON-logprob AUC over '
+                            f'{len(_TOK["ontology"])} ontology tags')
+            except Exception as e:
+                _TOK['ontology'] = set()
+                logger.warning(f'[mldecoder] no ontology_tags.json ({e}); JSON-logprob AUC off')
+            logger.info(f'[mldecoder] ASL weight schedule: {ASL_WEIGHT_START} -> '
+                        f'{ASL_WEIGHT_END} over {ASL_DECAY_STEPS} steps ({ASL_DECAY_SHAPE}), '
+                        f'then constant · max_steps={state.max_steps}'
+                        if ASL_WEIGHT is None else
+                        f'[mldecoder] ASL weight pinned constant at {ASL_WEIGHT}')
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            _SCHED['step'] = state.global_step
+
+        def on_step_end(self, args, state, control, **kwargs):
+            # Emit via trainer.log() rather than mutating the `logs` dict in on_log:
+            # HF registers WandbCallback during Trainer.__init__ and this callback is added
+            # afterwards, so on_log runs AFTER wandb has already shipped the dict and any keys
+            # added there would never reach wandb. trainer.log() starts a fresh round-trip
+            # through every callback, and wandb keys off state.global_step so the extra call
+            # merges onto the same step as the LM loss.
+            every = max(int(getattr(args, 'logging_steps', 1) or 1), 1)
+            if _RUN['n'] == 0 or state.global_step % every != 0:
+                return
+            n = _RUN['n']
+            trainer = getattr(self, '_trainer', None)
+            payload = {
+                'train/ar_loss': _RUN['ar'] / n,
+                'train/asl_loss': _RUN['asl'] / n,
+                'train/asl_weight': current_asl_weight(),
+                'train/asl_weighted': current_asl_weight() * _RUN['asl'] / n,
+            }
+            _RUN['ar'] = _RUN['asl'] = 0.0
+            _RUN['n'] = 0
+            if trainer is not None:
+                trainer.log(payload)
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            import torch as _t
+            if not _EVAL['logits']:
+                logger.warning('[mldecoder] eval produced no cls logits — no val AUC')
+                return
+            logits_t = _t.cat(_EVAL['logits'])
+            labels_t = _t.cat(_EVAL['labels'])
+            keys_l = list(_EVAL['keys'])
+            _EVAL['logits'].clear()
+            _EVAL['labels'].clear()
+            _EVAL['keys'].clear()
+            is_rank0 = True
+            # Eval is sharded across ranks, so each process holds only 1/world_size of the val
+            # set. Without this gather the AUC would be computed on rank 0's shard alone and
+            # most of the rare tags (down to 0.03% prevalence) would have no positives at all.
+            # Safe here: every rank has finished evaluating, so all reach the collective.
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                    is_rank0 = dist.get_rank() == 0
+                    parts = [None] * dist.get_world_size()
+                    dist.all_gather_object(parts, (logits_t.numpy(), labels_t.numpy(), keys_l))
+                    import numpy as _np
+                    logits_t = _t.from_numpy(_np.concatenate([p[0] for p in parts]))
+                    labels_t = _t.from_numpy(_np.concatenate([p[1] for p in parts]))
+                    keys_l = [k for p in parts for k in p[2]]
+            except Exception as e:
+                logger.warning(f'[mldecoder] val AUC gather failed ({e}); scoring this '
+                               f'rank\'s shard only')
+            logits = logits_t.numpy()
+            labels = labels_t.numpy()
+            tags = get_label_table().tags
+            aucs, aps, skipped = _per_tag_auc(logits, labels, tags)
+            if not aucs:
+                logger.warning('[mldecoder] no tag had both classes in val — no AUC')
+                return
+            payload = {f'val_auc/{k}': v for k, v in aucs.items()}
+            payload.update({f'val_ap/{k}': v for k, v in aps.items()})
+            payload['val/macro_auc'] = sum(aucs.values()) / len(aucs)
+            payload['val/macro_ap'] = sum(aps.values()) / len(aps)
+            payload['val/n_tags_scored'] = len(aucs)
+            payload['val/n_tags_skipped'] = skipped
+            payload['val/n_studies'] = int(labels.shape[0])
+            # --- LM-side AUC from the classification JSON's own true/false logprobs -------
+            if _LM['score']:
+                import numpy as _np
+                from collections import defaultdict as _dd
+                from sklearn.metrics import roc_auc_score as _auc
+                by = _dd(lambda: ([], []))
+                for sc_, lb_, tg_ in zip(_LM['score'], _LM['label'], _LM['tag']):
+                    by[tg_][0].append(sc_)
+                    by[tg_][1].append(lb_)
+                lm_aucs, lm_skip = {}, 0
+                for tg_, (sv, lv) in by.items():
+                    lv = _np.asarray(lv)
+                    if lv.sum() == 0 or lv.sum() == len(lv):
+                        lm_skip += 1
+                        continue
+                    lm_aucs[tg_] = float(_auc(lv, _np.asarray(sv)))
+                # snapshot the raw triples before clearing so the dump block can persist them
+                _LM['_saved_score'] = list(_LM['score'])
+                _LM['_saved_label'] = list(_LM['label'])
+                _LM['_saved_tag'] = list(_LM['tag'])
+                _LM['score'].clear(); _LM['label'].clear(); _LM['tag'].clear()
+                if lm_aucs:
+                    payload.update({f'val_json_auc/{k}': v for k, v in lm_aucs.items()})
+                    payload['val_json/macro_auc'] = sum(lm_aucs.values()) / len(lm_aucs)
+                    payload['val_json/n_tags_scored'] = len(lm_aucs)
+                    payload['val_json/n_tags_skipped'] = lm_skip
+                    logger.info(f'[mldecoder] VAL JSON-logprob macro AUC '
+                                f'{payload["val_json/macro_auc"]:.4f} over {len(lm_aucs)} '
+                                f'ontology tags ({lm_skip} single-class)')
+            # ---- persist the COMPLETE predictions for this eval step -------------------------
+            # Only rank 0 writes (it holds the gathered full val set). Fully guarded: a dump
+            # failure must never take down a multi-day run.
+            if is_rank0:
+                try:
+                    import numpy as _np
+                    step = int(getattr(state, 'global_step', 0))
+                    out_dir = EVAL_PRED_DIR or os.path.join(getattr(args, 'output_dir', '.'),
+                                                            'eval_predictions')
+                    os.makedirs(out_dir, exist_ok=True)
+                    # head predictions: N x 132 logits + labels, per-row study key, tag order
+                    _np.savez_compressed(
+                        os.path.join(out_dir, f'head_step{step:06d}.npz'),
+                        logits=logits.astype('float32'),
+                        probs=(1.0 / (1.0 + _np.exp(-logits))).astype('float32'),
+                        labels=labels.astype('int8'),
+                        keys=_np.array([k if k is not None else '' for k in keys_l], dtype=object),
+                        tags=_np.array(tags, dtype=object),
+                        step=step)
+                    # LM-side presence: per (study-less) tag score/label triples for this eval
+                    if _LM.get('_saved_score') is not None:
+                        _np.savez_compressed(
+                            os.path.join(out_dir, f'lmjson_step{step:06d}.npz'),
+                            score=_np.asarray(_LM['_saved_score'], dtype='float32'),
+                            label=_np.asarray(_LM['_saved_label'], dtype='int8'),
+                            tag=_np.array(_LM['_saved_tag'], dtype=object),
+                            step=step)
+                        _LM['_saved_score'] = _LM['_saved_label'] = _LM['_saved_tag'] = None
+                    logger.info(f'[mldecoder] saved eval predictions -> '
+                                f'{out_dir}/head_step{step:06d}.npz '
+                                f'({logits.shape[0]} studies x {logits.shape[1]} tags)')
+                except Exception as e:
+                    logger.warning(f'[mldecoder] eval-prediction dump failed ({type(e).__name__}: '
+                                   f'{e}); training continues')
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None:
+                trainer.log(payload)
+            top = sorted(aucs.items(), key=lambda kv: -kv[1])[:5]
+            bot = sorted(aucs.items(), key=lambda kv: kv[1])[:5]
+            logger.info(f'[mldecoder] VAL macro AUC {payload["val/macro_auc"]:.4f} · '
+                        f'macro AP {payload["val/macro_ap"]:.4f} · {len(aucs)} tags scored, '
+                        f'{skipped} skipped (single-class) · n={labels.shape[0]}')
+            logger.info('[mldecoder]   best: ' + ', '.join(f'{k}={v:.3f}' for k, v in top))
+            logger.info('[mldecoder]   worst: ' + ', '.join(f'{k}={v:.3f}' for k, v in bot))
+
+    orig_init = SwiftMixin.__init__
+
+    def __init__(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        cb = _StepProbe()
+        cb._trainer = self
+        self.add_callback(cb)
+
+    SwiftMixin.__init__ = __init__
+    logger.info('[mldecoder] step probe callback registered')
+
+
+def patch_model_prepare():
+    """Attach the head in TunerMixin.prepare_model.
+
+    This MUST happen before the Trainer is constructed, because the optimizer is built inside
+    Trainer.__init__ over model.parameters() -- a head added after that point would collect
+    gradients that no optimizer step ever applies, i.e. it would silently never train.
+    swift/pipelines/train/sft.py calls prepare_model at line 182 and builds the trainer at 189,
+    so hooking prepare_model puts the head in the optimizer.
+    """
+    from swift.pipelines.train.tuner import TunerMixin
+
+    orig = TunerMixin.prepare_model.__func__
+
+    @classmethod
+    def prepare_model(cls, args, model, **kwargs):
+        model = orig(cls, args, model, **kwargs)
+        attach_head(model.module if hasattr(model, 'module') else model)
+        return model
+
+    TunerMixin.prepare_model = prepare_model
+    logger.info('[mldecoder] hooked TunerMixin.prepare_model (head lands before the optimizer)')
+
+
+from swift_plugins.qure_plugin_mode import is_inference  # noqa: E402
+
+if is_inference():
+    # Every patch below is train-only: they look cls labels up from the row, fold ASL into the
+    # loss, and shape the optimizer. Under `swift infer` there is no loss and no optimizer, and
+    # the label lookup would load the 1.1M-key sidecar parquet for nothing on every worker.
+    # `VisionMLDecoderHead` and `attach_head` stay importable -- mldecoder_infer_plugin.py
+    # imports the head class from here to load the checkpoint's `ml_decoder_head.*` tensors.
+    logger.info('[mldecoder] inference mode — train-only patches NOT installed. For head '
+                'logits at inference use mldecoder_infer_plugin.py with --infer_backend pt.')
+else:
+    patch_template()
+    patch_step_probe()
+    patch_model_prepare()
+    patch_head_param_group()
+    logger.info('[mldecoder] plugin loaded — run with --packing false (no --loss_type needed)')

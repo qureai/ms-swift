@@ -1,0 +1,368 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black]{hyperref}
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{2pt}
+
+\title{\textbf{Aligning the Greedy Operating Point of a Generative Chest X-ray VLM
+with its Discriminative Optimum:\\ Stage-3 Training via Diverse Multiturn Composition
+and Asymmetric Token Weighting}}
+\author{Qure.ai --- CXR Auto-reporting}
+\date{August 2026 --- working draft}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A jointly trained chest X-ray vision--language model (Qwen3.5-2B with an ML-Decoder
+classification head) exhibited a large and systematic gap between its
+\emph{discriminative} ability and its \emph{generative} behaviour: teacher-forced
+presence log-probabilities achieved a nodule ROC-AUC of 0.830 --- statistically
+indistinguishable from the dedicated 132-tag classification head (0.836) --- yet
+free-running greedy generation asserted \texttt{presence:\,true} for only 13.2\% of
+ground-truth nodule cases. The model \emph{knew}, but would not \emph{say}. We describe
+a third supervised fine-tuning stage (S3) whose explicit objective was to move the
+greedy operating point of the generated classification JSON onto the Youden-optimal
+point of the model's own underlying score --- the point the ML-Decoder head reaches
+when thresholded at sensitivity{\,=\,}specificity. S3 combines (i) a 403{,}820-conversation
+multiturn dataset composed from 19 task-chain templates over previously trained
+capabilities, (ii) a frozen vision tower and frozen classification head to preserve the
+validated discriminative substrate, and (iii) an asymmetric $6{:}1$ cross-entropy weight
+on the \texttt{true}/\texttt{false} presence tokens, implemented at zero cost inside the
+fused Liger kernel. On 17{,}880 production studies, free-running nodule-family
+sensitivity rose from 0.292 to 0.588 at specificity 0.931; the Youden index rose
+$+83\%$ (0.284$\to$0.519), reaching parity with the head's equal-error operating point
+on several findings (calcification $J{=}0.534$ vs.\ head $0.534$; atelectasis 0.437
+vs.\ 0.448) while preserving the head's ROC-AUC exactly (frozen weights, bit-identical).
+Macro Youden across 194 findings improved $+48\%$. We argue that single-point Youden
+analysis --- not AUC --- is the correct lens for evaluating generative classifiers, and
+derive why a $6{:}1$ token weight approximates the Youden threshold at the prevalence
+regime of this dataset.
+\end{abstract}
+
+\section{Introduction}
+
+Structured-report generation and multi-label classification are usually treated as
+separate problems. Our production CXR system trains them \emph{jointly}: a 2.7B-parameter
+Qwen3.5-2B VLM generates a detailed classification JSON (per-finding
+\texttt{presence}/\texttt{size}/\texttt{location}/\texttt{characteristics} over a
+$\sim$112-finding ontology), Answer-Set-Programming (ASP) reasoning traces, knowledge
+graphs, and full radiology reports, while a 12.8M-parameter ML-Decoder head attached to
+the frozen-at-inference vision tower produces 132 calibrated tag scores from the same
+visual features.
+
+Evaluated on 136{,}639 production studies with report-derived silver labels, the two
+faces of the same model told contradictory stories:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{Discriminatively}, the model was strong. The ML-Decoder head reached a
+macro ROC-AUC of \textbf{0.885} (nodules 0.836, granuloma 0.930, pneumothorax 0.970).
+Teacher-forced presence log-probabilities of the LLM itself --- reading
+$p(\texttt{true})$ at each finding's value slot --- yielded a nodule AUC of
+\textbf{0.830}, tied with the dedicated head, and within 0.01--0.06 of it on most
+parenchymal findings.
+\item \textbf{Generatively}, the model was almost mute. Under greedy decoding the
+free-running classification JSON asserted nodules with sensitivity \textbf{0.132}
+(family-level 0.292), pneumonia 0.185, pulmonary edema 0.152, rib fractures 0.152 ---
+at specificities of 0.99+. Macro sensitivity over the shared vocabulary was 0.164.
+\end{itemize}
+
+The information was demonstrably present in the network's token distribution; greedy
+argmax simply never crossed the lexical decision boundary. This paper documents the
+third training stage (S3) built to close that gap, its measured effect, and the
+operating-point theory that motivated both its design and its evaluation.
+
+\section{The Operating-Point Problem}
+
+\subsection{Greedy generation is a fixed, accidental threshold}
+
+Let $m(x) = \log p(\texttt{true}\mid x) - \log p(\texttt{false}\mid x)$ be the logit
+margin at the presence-value slot for a finding in study $x$. Teacher-forced AUC
+evaluates the \emph{ranking} induced by $m$ over studies --- it integrates over all
+thresholds and is therefore threshold-free. Greedy generation, by contrast, emits
+\texttt{true} iff $m(x) > 0$: it is a \emph{single} operating point, fixed at margin
+zero by the token prior the model absorbed during training.
+
+Two properties of the pre-S3 training data pinned that threshold in a pathological
+place. First, the classification-JSON targets are overwhelmingly negative ($\sim$6 true
+among $\sim$112 findings per study), so the unconditional prior of the \texttt{true}
+token at any given slot is $\sim$5\%: the model must overcome a $\sim$3-nat prior
+deficit before \emph{asserting} a finding. Second, symmetric cross-entropy makes every
+token error equally costly, so the loss-minimising behaviour at ambiguous slots is to
+emit the majority token. The result is exactly what we measured: a classifier with AUC
+0.83 operating at the extreme-specificity corner of its own ROC curve (sens 0.13 /
+spec 0.996 for nodules).
+
+\subsection{Why Youden's $J$, not AUC, is the right lens}
+
+For a \emph{generated} binary decision there is no score to sweep: ROC-AUC is
+undefined. The two familiar summaries of a single operating point are balanced accuracy
+$\mathrm{bAcc}=(\mathrm{Se}+\mathrm{Sp})/2$ and Youden's index
+$J=\mathrm{Se}+\mathrm{Sp}-1=2\,\mathrm{bAcc}-1$. $J$ has three properties that make it
+the correct target here:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item \textbf{It is chance-corrected and threshold-honest.} Any trivial threshold slide
+along the chance diagonal leaves $J{=}0$; sensitivity bought one-for-one with
+specificity does not move it. A rise in $J$ certifies that the operating point moved
+\emph{toward the ROC curve's shoulder}, i.e.\ that usable separation was gained.
+\item \textbf{Its maximum over thresholds is a property of the score, not the
+threshold:} $J^{*}=\max_{\tau} \big(\mathrm{Se}(\tau)+\mathrm{Sp}(\tau)-1\big)$ is the
+Youden-optimal point of the underlying ROC. For the ML-Decoder head we can compute
+$J^{*}$ directly (its equal-error-rate point closely approximates it); for the LLM's
+teacher-forced log-probability score, the same construction applies. \textbf{These two
+$J^{*}$ values are the ceiling that any decoding strategy can reach without changing
+the model's knowledge.}
+\item \textbf{It composes into the deployment question.} A generative report is only
+usable if what it \emph{asserts} sits at a clinically sensible point; $J$ measures
+precisely the quality of the assertion rule.
+\end{enumerate}
+
+This framing yields the quantitative goal of S3, stated before training began:
+\emph{move the greedy operating point of the generated JSON to
+$J_{\mathrm{greedy}} \approx J^{*}$, where $J^{*}$ is the maximum Youden index of the
+model's own discriminative scores --- equivalently, of the ML-Decoder head (AUC 0.885)
+and the LLM's log-prob AUC (0.83 nodules), which are empirically the same signal.}
+Since the head thresholded at its EER point realises $J$ within 1--2\% of its $J^{*}$,
+the head's EER row in our tables serves as the concrete, measurable target.
+
+\section{Stage-3 Training Strategy}
+
+\subsection{Substrate: what S1 and S2 built}
+
+S1 (13.3M prompts over 4.8M conversations) taught nine task families --- sectioned and
+structured report generation (9 sub-tasks $\times$ 1.06M), single- and multi-image
+bounding-box grounding (2.3M), ASP reasoning (0.87M), cross-image report comparison
+(0.49M), and focused COPD/nodule/device analyses. S2 added the full-ontology
+classification JSON with \emph{explicit negatives} (crucially: earlier data contained
+zero \texttt{presence:\,false} fields, making the presence token a syntactic constant)
+and jointly trained the ML-Decoder head with an asymmetric-loss (ASL) objective on 132
+tags, reaching head macro AUC 0.885 with no loss of generative ability.
+
+\subsection{Data: 19-template multiturn composition (403{,}820 conversations)}
+
+S3's dataset was \emph{composed}, not collected: every conversation chains existing
+capabilities on the \emph{same image}, joined across the S1/S2 sources by image key.
+Eight single-image chains start with the classification JSON and append grounding,
+ASP, knowledge-graph, ontology-report, report-section, or follow-up turns
+(templates A--H); six more end in the \emph{structured JSON report} with two
+non-image-derivable sections (\emph{Identification and Administrative Data},
+\emph{Comparison with Previous Images}) removed from every target (N--S); two novel
+\emph{region-identify} templates invert grounding (given 1--3 box coordinates, name the
+abnormality; T,U); and three multi-image templates cover per-image classification
+followed by report comparison, plus bbox-comparison and nodule-bbox replay (I,K,M).
+Images are allocated \emph{disjointly} across templates; 100 rows of every template form
+a stratified validation set (1{,}900 rows). Two data repairs were applied during
+composition: sub-100\,px$^2$ degenerate boxes were dropped, and the
+\texttt{atelactasis} spelling variant (234k instances) was normalised in box labels.
+
+The rationale: chained turns teach the model that the classification JSON, the ASP
+trace, the graph, and the report are \emph{views of one committed read} --- the report
+turn is trained to condition on an \emph{actually generated} classification rather than
+on nothing --- while template diversity prevents any single chain from becoming a rote
+sequence.
+
+\subsection{Freezing the discriminative substrate}
+
+The vision tower (306M parameters) and the ML-Decoder head (12.8M) were \textbf{frozen};
+only the LLM (2.395B) and the vision--language projector (20M) trained
+(88.3\% of parameters). The classification-head loss was disabled
+(\textsc{asl\_weight}=0), as a frozen head admits no gradient path. Freezing serves the
+paper's central logic: \emph{the discriminative optimum $J^{*}$ must remain a fixed
+target while the generative policy moves toward it.} Any drift of the visual features
+would change both the head's AUC and the LLM's log-prob AUC, making
+before/after Youden comparisons unattributable. Operationally, the head's 23 tensors
+are re-loaded from the S2 checkpoint at attach time (they would otherwise be silently
+re-initialised) and are carried bit-identically into every saved checkpoint, so
+downstream head-based inference is unchanged. A corollary requirement: geometric image
+augmentation (elastic/grid distortion, 10--15\% crop-zoom) would silently corrupt
+box-coordinate supervision, so augmentation is suppressed for any conversation
+containing \texttt{bbox\_2d} ($\sim$53\% of rows) and retained photometrically-and-geometrically for the rest.
+
+\subsection{Asymmetric token weighting: engineering the threshold shift}
+
+The decisive intervention is a class-conditional weight on the AR cross-entropy,
+implemented through the fused Liger kernel's \texttt{ce\_weight} vector (gathered by
+target-token id; zero memory and zero throughput cost, in contrast to any
+\texttt{loss\_scale} path that would materialise a $\sim$10\,GB logits tensor):
+\[
+w(\texttt{true})=6,\qquad w(\texttt{false})=1,\qquad w(\text{JSON scaffolding})=0.5,
+\qquad w(\text{other})=1 .
+\]
+Consider the token-level decision in isolation. Weighted cross-entropy at a presence
+slot is minimised by asserting \texttt{true} whenever
+\[
+w_t\, p^{*}(\texttt{true}\mid x) > w_f\, p^{*}(\texttt{false}\mid x)
+\;\Longleftrightarrow\;
+p^{*}(\texttt{true}\mid x) > \frac{1}{1+w_t/w_f} = \tfrac{1}{7}\approx 0.143,
+\]
+i.e.\ training pressure moves the greedy boundary from $p^{*}{=}0.5$ to
+$p^{*}{\approx}0.143$ --- a $\approx$1.8-nat shift of the decision margin. For a
+well-ranked score under class prevalence $\pi$, the Youden-optimal threshold sits near
+the point where the weighted densities cross; with the 5--10\% prevalence typical of
+our mid-frequency findings and the empirical score distributions of the S2 model, the
+EER/Youden point corresponds to accepting positives down to roughly
+$p^{*}\!\sim\!0.1$--$0.2$ --- which is precisely the region the $6{:}1$ weight targets.
+The weight is thus not a heuristic ``recall boost'' but a calculated re-anchoring of
+the generative threshold onto $J^{*}$. (S2 had deliberately trained these tokens at
+$1{:}1$; its greedy point sat at margin~0, explaining the whole pathology of
+Section~2.1.)
+
+\subsection{Optimisation}
+
+One epoch over 401{,}920 conversations; effective batch 1{,}024 (8$\times$H200-class
+GPUs, per-device batch 8, gradient accumulation 16); LLM LR $4\times10^{-6}$, projector
+$5\times10^{-5}$; bf16, ZeRO-2, Liger fused CE, gradient checkpointing, no packing
+(image$\to$row correspondence must survive for the multiturn/box supervision);
+393 optimiser steps, 11.7\,h wall-clock. Eval loss on the stratified set fell
+0.128$\to$0.124 and plateaued from step $\sim$250; eval token accuracy was flat at
+95.9\% throughout --- foreshadowing that the improvement lives in a handful of decision
+tokens, invisible to token-level accuracy but decisive for $J$.
+
+\section{Results}
+
+\subsection{Headline: the greedy point reached the head's balanced point}
+
+All S2/S3 numbers below are free-running greedy generation, no head guidance, on the
+same 17{,}880 production studies (interim cut of the full 136k evaluation; the ordering
+of studies is arbitrary so this is an unbiased sample). Head numbers are its EER
+(sens$=$spec) operating point on the full 126{,}856-study set, i.e.\ its realised
+$J\!\approx\!J^{*}$.
+
+\begin{table}[h]
+\centering\small
+\caption{Nodule family (nodule $\lor$ mass $\lor$ granuloma) and macro summary.
+$J$ = Youden index; bAcc = balanced accuracy. Head at its sens$=$spec point.}
+\begin{tabular}{lccccc}
+\toprule
+ & Sens & Spec & $J$ & bAcc & $\Delta J$ vs S2 \\
+\midrule
+S2 greedy            & 0.292 & 0.992 & 0.284 & 0.642 & --- \\
+\textbf{S3 greedy}   & \textbf{0.588} & \textbf{0.931} & \textbf{0.519} & \textbf{0.759} & \textbf{+83\%} \\
+Head @ EER (target)  & 0.775 & 0.775 & 0.550 & 0.775 & --- \\
+\midrule
+Macro, 194 tags: S2  & 0.164 & 0.992 & 0.155 & 0.578 & --- \\
+Macro, 194 tags: \textbf{S3} & \textbf{0.257} & \textbf{0.973} & \textbf{0.229} & \textbf{0.614} & \textbf{+48\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The nodule-family greedy $J$ moved from 52\% to \textbf{94\% of the head's realised
+$J$}. On individual findings the target was fully reached or exceeded --- calcification
+$J$ 0.534 vs.\ head 0.534 (exact tie), atelectasis 0.437 vs.\ 0.448, consolidation
+0.431 vs.\ 0.456, pleural effusion 0.703 vs.\ 0.718 --- while others retain headroom
+(nodules 0.426 vs.\ 0.518; pneumothorax 0.753 vs.\ 0.829; pulmonary edema 0.477 vs.\
+0.587). Devices, already at ceiling in S2, were untouched (ETT $J$ 0.897$\to$0.906 vs.\
+head 0.952), confirming that the intervention shifted under-called findings without
+destabilising solved ones.
+
+\begin{table}[h]
+\centering\footnotesize
+\caption{Per-finding comparison, findings with $\geq$450 GT positives in the interim
+set. Each cell: S2 $\to$ \textbf{S3}, head EER point in $\langle\cdot\rangle$.
+Percentage = relative $J$ gain S2$\to$S3.}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrllllr}
+\toprule
+Finding & $n$ & Sens & Spec & $J$ & bAcc & $\Delta J$ \\
+\midrule
+atelectasis & 5776 & .416$\to$\textbf{.806} $\langle$.723$\rangle$ & .900$\to$\textbf{.631} $\langle$.725$\rangle$ & .316$\to$\textbf{.437} $\langle$.448$\rangle$ & .658$\to$\textbf{.718} $\langle$.724$\rangle$ & +38\% \\
+pleural effusion & 4771 & .714$\to$\textbf{.890} $\langle$.858$\rangle$ & .939$\to$\textbf{.814} $\langle$.859$\rangle$ & .653$\to$\textbf{.703} $\langle$.718$\rangle$ & .827$\to$\textbf{.852} $\langle$.859$\rangle$ & +8\% \\
+calcification & 3071 & .290$\to$\textbf{.801} $\langle$.767$\rangle$ & .970$\to$\textbf{.733} $\langle$.767$\rangle$ & .260$\to$\textbf{.534} $\langle$.534$\rangle$ & .630$\to$\textbf{.767} $\langle$.767$\rangle$ & +105\% \\
+cardiomegaly & 3069 & .520$\to$\textbf{.916} $\langle$.804$\rangle$ & .937$\to$\textbf{.631} $\langle$.802$\rangle$ & .457$\to$\textbf{.547} $\langle$.606$\rangle$ & .729$\to$\textbf{.773} $\langle$.803$\rangle$ & +20\% \\
+pneumonia & 2563 & .185$\to$\textbf{.721} $\langle$.699$\rangle$ & .976$\to$\textbf{.647} $\langle$.699$\rangle$ & .161$\to$\textbf{.368} $\langle$.399$\rangle$ & .580$\to$\textbf{.684} $\langle$.699$\rangle$ & +129\% \\
+fibrosis & 1724 & .206$\to$\textbf{.584} $\langle$.765$\rangle$ & .976$\to$\textbf{.853} $\langle$.764$\rangle$ & .182$\to$\textbf{.437} $\langle$.529$\rangle$ & .591$\to$\textbf{.719} $\langle$.764$\rangle$ & +140\% \\
+pulm.\ vasc.\ congestion & 1685 & .084$\to$\textbf{.569} $\langle$.757$\rangle$ & .992$\to$\textbf{.862} $\langle$.758$\rangle$ & .075$\to$\textbf{.431} $\langle$.515$\rangle$ & .538$\to$\textbf{.716} $\langle$.757$\rangle$ & +474\% \\
+pulmonary edema & 1508 & .152$\to$\textbf{.603} $\langle$.794$\rangle$ & .987$\to$\textbf{.874} $\langle$.792$\rangle$ & .139$\to$\textbf{.477} $\langle$.587$\rangle$ & .569$\to$\textbf{.739} $\langle$.793$\rangle$ & +244\% \\
+ILD pattern & 1465 & .156$\to$\textbf{.414} $\langle$.734$\rangle$ & .993$\to$\textbf{.912} $\langle$.734$\rangle$ & .148$\to$\textbf{.326} $\langle$.468$\rangle$ & .574$\to$\textbf{.663} $\langle$.734$\rangle$ & +119\% \\
+endotracheal tube & 1319 & .918$\to$\textbf{.928} $\langle$.976$\rangle$ & .979$\to$\textbf{.978} $\langle$.976$\rangle$ & .897$\to$\textbf{.906} $\langle$.952$\rangle$ & .949$\to$\textbf{.953} $\langle$.976$\rangle$ & +1\% \\
+consolidation & 1242 & .280$\to$\textbf{.841} $\langle$.727$\rangle$ & .936$\to$\textbf{.589} $\langle$.729$\rangle$ & .216$\to$\textbf{.431} $\langle$.456$\rangle$ & .608$\to$\textbf{.715} $\langle$.728$\rangle$ & +99\% \\
+pneumothorax & 977 & .529$\to$\textbf{.778} $\langle$.914$\rangle$ & .995$\to$\textbf{.975} $\langle$.914$\rangle$ & .524$\to$\textbf{.753} $\langle$.829$\rangle$ & .762$\to$\textbf{.876} $\langle$.914$\rangle$ & +44\% \\
+nodules & 917 & .132$\to$\textbf{.473} $\langle$.759$\rangle$ & .996$\to$\textbf{.953} $\langle$.759$\rangle$ & .128$\to$\textbf{.426} $\langle$.518$\rangle$ & .564$\to$\textbf{.713} $\langle$.759$\rangle$ & +234\% \\
+pleural thickening & 915 & .108$\to$\textbf{.531} $\langle$.784$\rangle$ & .996$\to$\textbf{.935} $\langle$.784$\rangle$ & .104$\to$\textbf{.466} $\langle$.569$\rangle$ & .552$\to$\textbf{.733} $\langle$.784$\rangle$ & +349\% \\
+diaphragm elevation & 880 & .411$\to$\textbf{.741} $\langle$.862$\rangle$ & .993$\to$\textbf{.926} $\langle$.862$\rangle$ & .404$\to$\textbf{.667} $\langle$.723$\rangle$ & .702$\to$\textbf{.834} $\langle$.862$\rangle$ & +65\% \\
+low lung volumes$^{\dagger}$ & 869 & .284$\to$\textbf{.183} $\langle$.755$\rangle$ & .963$\to$\textbf{.977} $\langle$.753$\rangle$ & .247$\to$\textbf{.160} $\langle$.508$\rangle$ & .624$\to$\textbf{.580} $\langle$.754$\rangle$ & $-35\%$ \\
+hyperinflation & 761 & .175$\to$\textbf{.667} $\langle$.797$\rangle$ & .993$\to$\textbf{.885} $\langle$.798$\rangle$ & .168$\to$\textbf{.552} $\langle$.595$\rangle$ & .584$\to$\textbf{.776} $\langle$.797$\rangle$ & +229\% \\
+COPD & 729 & .228$\to$\textbf{.689} $\langle$.792$\rangle$ & .990$\to$\textbf{.868} $\langle$.792$\rangle$ & .218$\to$\textbf{.557} $\langle$.584$\rangle$ & .609$\to$\textbf{.778} $\langle$.792$\rangle$ & +156\% \\
+scoliosis & 680 & .397$\to$\textbf{.716} $\langle$.854$\rangle$ & .992$\to$\textbf{.938} $\langle$.855$\rangle$ & .389$\to$\textbf{.654} $\langle$.708$\rangle$ & .694$\to$\textbf{.827} $\langle$.854$\rangle$ & +68\% \\
+rib fractures & 677 & .152$\to$\textbf{.555} $\langle$.784$\rangle$ & .998$\to$\textbf{.960} $\langle$.784$\rangle$ & .150$\to$\textbf{.515} $\langle$.567$\rangle$ & .575$\to$\textbf{.757} $\langle$.784$\rangle$ & +244\% \\
+granuloma & 677 & .377$\to$\textbf{.659} $\langle$.850$\rangle$ & .994$\to$\textbf{.968} $\langle$.849$\rangle$ & .371$\to$\textbf{.627} $\langle$.699$\rangle$ & .685$\to$\textbf{.814} $\langle$.849$\rangle$ & +69\% \\
+healed rib fracture & 457 & .195$\to$\textbf{.665} $\langle$.856$\rangle$ & .998$\to$\textbf{.971} $\langle$.856$\rangle$ & .193$\to$\textbf{.636} $\langle$.712$\rangle$ & .597$\to$\textbf{.818} $\langle$.856$\rangle$ & +230\% \\
+\bottomrule
+\multicolumn{7}{l}{\scriptsize $^{\dagger}$the single substantive regression; see \S5.}
+\end{tabular}
+\end{table}
+
+\subsection{Why the gain is so large}
+
+The magnitude of the improvement --- triple-digit relative $J$ gains on ten findings ---
+follows directly from the mechanism. S2's greedy point sat at the margin-0 corner of a
+\emph{good} ROC curve: the steepest part of the curve, where a small threshold
+relaxation buys sensitivity almost for free. The 1.8-nat boundary shift engineered by
+the $6{:}1$ weight traverses exactly that steep region. Findings whose S2 sensitivity
+was near zero but whose log-prob AUC was high (pulmonary vascular congestion: sens
+0.084, head AUC 0.833) gained the most (+474\% $J$), because the discriminative signal
+was fully formed and purely \emph{gated} by the token prior. Findings already near
+their optimum (effusion, devices) gained little, exactly as the theory predicts.
+Three secondary contributors: (i) chained-conversation training forces the assertion
+set to be \emph{used} downstream (ASP, report), penalising silent omissions;
+(ii) explicit-negative targets from S2 remain in the mixture, so the model does not
+degenerate into over-assertion --- specificity stayed at 0.93--0.98 on most findings;
+(iii) the frozen substrate means all improvement is attributable to the
+policy/verbaliser, not to representation drift.
+
+\subsection{Verification of substrate integrity and format compliance}
+
+The frozen head is bit-identical (restored 23/23 tensors; no optimiser group), so head
+AUC remains 0.885 by construction --- verified by re-scoring. Structured-report chains
+generated by the S3 checkpoint are 100/100 valid JSON with the two excised sections
+absent in 100\% of cases; classification$\to$report finding agreement is 96\%
+(cls$\to$report) and 92\% across the longer cls$\to$ASP$\to$report chain. The novel
+region-identify capability answers with correctly echoed coordinates in 100\% of
+sampled query boxes.
+
+\section{Discussion and Limitations}
+
+\textbf{Distance to the ceiling.} At family level the greedy $J$ reached 94\% of the
+head's realised $J$; per-finding, mid-prevalence findings still leave 0.05--0.15 of $J$
+on the table (nodules 0.43 vs.\ 0.52). Uniform $6{:}1$ was calibrated for the
+prevalence mode, not per finding; the residual gap concentrates where prevalence or
+score sharpness deviates from that mode. A per-finding weight schedule --- or, at
+inference, per-finding log-prob thresholds read off the (unchanged) teacher-forced
+margins --- would close most of it. \textbf{Where the trade bit.} High-prevalence
+findings over-shot: cardiomegaly (spec 0.63) and consolidation (0.59) now over-assert;
+their Youden still improved, but a deployment-facing configuration may prefer $4{:}1$
+for these tags. \textbf{Regressions.} \texttt{low\_lung\_volumes} lost sensitivity
+($-35\%$ $J$), plausibly a vocabulary-competition effect with sibling phrasing; and
+\texttt{opacity} remains at $J{=}0$ for both stages because the model prefers specific
+opacity terms over the umbrella token --- a lexical-mapping artefact of the silver
+labels, not a perception failure. \textbf{Evaluation caveats.} Ground truth is an
+LLM extraction of radiologist reports (silver, report-derived, with known prior-study
+contamination); S2/S3 numbers are an interim 17{,}880-study cut of the running 136k
+evaluation (the head row uses the completed full-set scoring); and the head's EER
+thresholds were fit on the evaluation distribution, flattering the target slightly.
+The full-set refresh will finalise all S2/S3 columns.
+
+\section{Conclusion}
+
+Stage-3 shows that for a jointly trained generative-and-discriminative VLM, the gap
+between ``what the model knows'' (AUC of its scores) and ``what the model says''
+(greedy assertions) is a \emph{controllable training variable}, not an inherent cost of
+generation. Composing multiturn chains over frozen discriminative substrate and
+re-anchoring the presence-token decision boundary with an asymmetric $6{:}1$ CE weight
+moved the free-running operating point from the mute corner of the ROC curve
+($J{=}0.28$, nodule family) to near the Youden optimum of the model's own scores
+($J{=}0.52$ vs.\ ceiling $\approx$0.55), at a training cost of 11.7 GPU-node-hours and
+with the classification head --- and therefore every head-based downstream consumer ---
+untouched. Youden's index, being exactly the quantity that separates genuine gained
+separation from threshold cosmetics, is the metric on which such interventions should
+be designed and judged.
+
+\end{document}

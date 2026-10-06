@@ -1,0 +1,4 @@
+[submodule "paper_vlm"]
+	path = paper_vlm
+	url = /fastdata4/sahil_work/VLM_qure/repos/paper_vlm.git
+	branch = main
