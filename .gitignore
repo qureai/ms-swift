@@ -165,3 +165,4 @@ paper_vlm_release/
 data_qure/
 .gradio/
 examples/train/liger/_smoke_subset.jsonl
+paper_vlm/
