@@ -1,0 +1,91 @@
+# GSPO curriculum RL for the CXR structured-report reward.
+#   swift rlhf examples/train/grpo/radiology_gspo_curriculum.yaml   (run in the swift_infer env)
+#
+# CURRICULUM: the three `dataset:` parquets are difficulty stages (easy -> medium -> hard), each
+# mixing all 8 tasks. With `dataset_shuffle: false` swift consumes them in listed order, so the model
+# is trained on easy prompts of every task first, then medium, then hard. Build/resize the stages with
+# /cache/fast_data_nas71/janhavi/data/rl_training/build_curriculum.py (default ~19.2k prompts).
+
+# ---- model: SFT VLM checkpoint -----------------------------------------------------------------
+# Qwen3.5-2B stage6b (tool-calling) SFT, checkpoint-608. Verified: Qwen3_5ForConditionalGeneration,
+# vision patch_size=16, args.json template=qwen3_5 (native -> the override below matches), and NO
+# vision_3d_config -> a plain 2D model, so the swift_infer vLLM 3D registration self-gates to a no-op
+# (vanilla Qwen3.5 vLLM class is used).
+model: /cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/vlm_ckpts/Qwen3.5-2B_stage6b_alltools/v0-20260906-173237/checkpoint-608
+torch_dtype: bfloat16
+tuner_type: full
+attn_impl: sdpa               # flash_attn not installed in swift_infer; switch to flash_attention_2 if you add it
+template: qwen3_5             # Qwen3.5 (v3, patch16). Overrides any v2.5 template baked into the checkpoint args.
+
+# ---- reward ------------------------------------------------------------------------------------
+rlhf_type: grpo
+external_plugins:
+  - examples/train/grpo/plugin/radiology_reward.py
+reward_funcs:
+  - radiology                 # task router: dispatches per-row on the `task` column
+# latest fine-tuned radiology embedding encoder used by the embedding sub-reward:
+reward_embedding_model: /cache/fast_data_nas71/janhavi/vlm_ckpts/qwen3_4b_embedding/15_sep_qwen3_4b_contrast_axes_v1/checkpoints/checkpoint-2500
+scale_rewards: group          # sub-rewards are already in [0,1]; group-standardize advantages
+
+# ---- data: curriculum stages, consumed IN ORDER (do not shuffle) -------------------------------
+# Each parquet carries a per-row `safety_score` (GT completeness from the tag-extraction JSON):
+# the reward scales the embedding sub-reward by it -- complete GT (safety=1) trusts the embedding
+# fully; sparse GT down-weights embedding and leans on the verifiable terms (cls/FP, bbox, atoms).
+# Rebuild with build_curriculum_safety.py. (bbox/comparison images aren't in the tag JSON -> safety
+# defaults to 1.0 for them, i.e. no change: bbox is verifiable, comparison is pair-based.)
+dataset:
+  - /cache/fast_data_nas71/janhavi/data/rl_training/curriculum/curriculum_easy.parquet
+  - /cache/fast_data_nas71/janhavi/data/rl_training/curriculum/curriculum_medium.parquet
+  - /cache/fast_data_nas71/janhavi/data/rl_training/curriculum/curriculum_hard.parquet
+# HIGH-TRUST alternative: the safety==1 subset only (most reliable embedding-reward data). Use these
+# as a phase-1 warmup (or on their own) if you want maximum GT reliability:
+#   - .../curriculum/curriculum_hq_easy.parquet
+#   - .../curriculum/curriculum_hq_medium.parquet
+#   - .../curriculum/curriculum_hq_hard.parquet
+dataset_shuffle: false        # KEY: preserve easy->medium->hard order (GRPO RepeatSampler shuffle=false)
+split_dataset_ratio: 0.0
+max_length: 8192
+
+# ---- GSPO core ---------------------------------------------------------------------------------
+importance_sampling_level: sequence
+beta: 0.0
+epsilon: 3e-4
+epsilon_high: 4e-4
+num_generations: 16
+steps_per_generation: 16
+num_iterations: 1
+# exploration / anti-collapse (keeps rollout diversity for consensus-style signals)
+dynamic_sample: true
+max_resample_times: 3
+
+# ---- rollout backend (from-source vLLM 0.26.0+cu128 in swift_infer, colocate) ------------------
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.5
+vllm_enforce_eager: true
+vllm_max_model_len: 8192
+vllm_limit_mm_per_prompt: '{"image": 1}'
+sleep_level: 1
+max_completion_length: 2048   # full reports need room -- avoids the smoke's all-clipped (reward=0) rollouts
+temperature: 1.0
+top_p: 0.9
+top_k: 20
+
+# ---- optimization ------------------------------------------------------------------------------
+num_train_epochs: 1           # one pass over the curriculum; raise to re-run the easy->hard ramp
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 1e-6
+warmup_ratio: 0.05
+deepspeed: zero2             # 2B full-FT fits zero2 on 4x L40S -> faster + simpler colocate weight-sync
+                            # (no ZeRO-3 gather). Switch to zero3 (+offload) only if you scale the model up.
+
+# ---- logging / io ------------------------------------------------------------------------------
+output_dir: /cache/fast_data_nas71/janhavi/data/rl_training/output/radiology_gspo_curriculum
+save_steps: 200
+save_total_limit: 3
+logging_steps: 5
+log_completions: true
+report_to:
+  - tensorboard
+dataloader_num_workers: 4

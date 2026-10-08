@@ -158,6 +158,9 @@ class GRPOArguments(GRPOArgumentsMixin):
     num_generations: int = 8  # G in the GRPO paper
     reward_funcs: List[str] = field(default_factory=list)
     reward_weights: List[float] = None
+    # Path/id of a fine-tuned SentenceTransformers embedding model used by custom reward
+    # plugins (e.g. the radiology report reward). If None, the embedding term is disabled.
+    reward_embedding_model: Optional[str] = None
     log_completions: bool = False
 
     # multi step

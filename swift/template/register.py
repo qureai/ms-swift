@@ -83,7 +83,14 @@ def get_template(
     ct_volume_size: Optional[str] = None,
     ct_augment: bool = False,
     ct_augment_prob: float = 0.15,
+    ct_load_dtype: str = 'float32',
+    ct_normalize: str = 'none',
     vision_3d_max_tokens: Optional[int] = None,
+    vision_3d_slowfast: bool = False,
+    vision_3d_fast_grid: str = '4,8,8',
+    vision_3d_patch_size: Optional[int] = None,
+    vision_3d_temporal_patch_size: Optional[int] = None,
+    vision_3d_merge_size: Optional[int] = None,
 ) -> 'Template':
     """Get or create a template instance for model input/output formatting.
 
@@ -224,5 +231,12 @@ def get_template(
         ct_volume_size=ct_volume_size,
         ct_augment=ct_augment,
         ct_augment_prob=ct_augment_prob,
+        ct_load_dtype=ct_load_dtype,
+        ct_normalize=ct_normalize,
         vision_3d_max_tokens=vision_3d_max_tokens,
+        vision_3d_slowfast=vision_3d_slowfast,
+        vision_3d_fast_grid=vision_3d_fast_grid,
+        vision_3d_patch_size=vision_3d_patch_size,
+        vision_3d_temporal_patch_size=vision_3d_temporal_patch_size,
+        vision_3d_merge_size=vision_3d_merge_size,
     )

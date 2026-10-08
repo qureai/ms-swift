@@ -150,6 +150,15 @@ class TemplateArguments:
     # Photon-style probabilistic volume augmentation (training only).
     ct_augment: bool = False
     ct_augment_prob: float = 0.15
+    # dtype of the LOADED CT volume tensor (host RAM / H2D). float32 (default) = current behavior; float16 /
+    # bfloat16 halve host RAM + transfer (the encoder downcasts to its compute dtype anyway). All volume math
+    # stays float32; only the stored result is cast.
+    ct_load_dtype: Literal['float32', 'float16', 'bfloat16'] = 'float32'
+    # ct_normalize: how the windowed CT channels are scaled before the 3D encoder.
+    #   'none'        -> keep windowing's [0,1] range (legacy; mismatches the tower's expected input stats).
+    #   'standardize' -> per-channel zero-mean/unit-std, matching what the pretrained vision tower expects
+    #                    (fixes the bias-dominated, input-independent patch-embed -> required for grounding).
+    ct_normalize: Literal['none', 'standardize'] = 'none'
 
     def __post_init__(self):
         if getattr(self, 'model_meta', None) is not None:
@@ -172,10 +181,38 @@ class TemplateArguments:
         from swift.utils.ct_windowing import num_ct_channels
         self.ct_num_channels = num_ct_channels(self.ct_windows, self.ct_window_base)
 
+    def _vision_3d_geometry(self):
+        """(patch_size, temporal_patch_size, merge_size) of the 3D encoder (`--vision_3d_model`), read from
+        ITS OWN config -- so variable-resolution CT works with ANY Qwen vision tower, not only one that
+        happens to share the host model's patch grid. Returns (None, None, None) if unavailable, in which
+        case the template falls back to the host processor's geometry."""
+        model = getattr(self, 'vision_3d_model', None)
+        if not model:
+            return (None, None, None)
+        try:
+            from transformers import AutoConfig
+            cfg = AutoConfig.from_pretrained(
+                model, trust_remote_code=bool(getattr(self, 'vision_3d_trust_remote_code', False)))
+            vc = getattr(cfg, 'vision_config', None) or cfg
+            p = getattr(vc, 'patch_size', None)
+            tps = getattr(vc, 'temporal_patch_size', None)
+            m = getattr(vc, 'spatial_merge_size', None) or getattr(vc, 'merge_size', None)
+            return (int(p) if p else None, int(tps) if tps else None, int(m) if m else None)
+        except Exception as e:  # noqa
+            from swift.utils import get_logger
+            get_logger().warning(
+                f'vision_3d: could not read patch geometry from --vision_3d_model={model} ({e}); '
+                'variable-resolution CT will fall back to the host processor geometry.')
+            return (None, None, None)
+
     def get_template_kwargs(self):
         truncation_strategy = self.truncation_strategy
         if truncation_strategy == 'delete':
             truncation_strategy = 'raise'
+        # 3D-encoder patch geometry for variable-resolution CT (only needed when --ct_volume_size is unset).
+        v3d_patch = v3d_tps = v3d_merge = None
+        if self.ct_volume_size is None and getattr(self, 'vision_3d_model', None):
+            v3d_patch, v3d_tps, v3d_merge = self._vision_3d_geometry()
         return {
             'template_type': self.template,
             'default_system': self.system,
@@ -204,6 +241,15 @@ class TemplateArguments:
             'ct_volume_size': self.ct_volume_size,
             'ct_augment': self.ct_augment,
             'ct_augment_prob': self.ct_augment_prob,
+            'ct_load_dtype': self.ct_load_dtype,
+            'ct_normalize': self.ct_normalize,
             # from ModelArguments (present on BaseArguments); how many tokens each CT volume expands to
             'vision_3d_max_tokens': getattr(self, 'vision_3d_max_tokens', None),
+            # slow-fast: <video> expands to fast_count (=prod(fast_grid)) instead of the native token count
+            'vision_3d_slowfast': getattr(self, 'vision_3d_slowfast', False),
+            'vision_3d_fast_grid': getattr(self, 'vision_3d_fast_grid', '4,8,8'),
+            # 3D-encoder patch geometry (from --vision_3d_model's config) for variable-resolution CT
+            'vision_3d_patch_size': v3d_patch,
+            'vision_3d_temporal_patch_size': v3d_tps,
+            'vision_3d_merge_size': v3d_merge,
         }

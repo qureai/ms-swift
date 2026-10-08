@@ -340,6 +340,14 @@ def load_dataset(
             disable_auto_column_mapping=disable_auto_column_mapping,
         )
         train_dataset = loader.load(dataset_syntax, dataset_meta, use_hf=use_hf)
+        # CT fork: tag each dataset with a short `channel` (derived from its file path) so per-dataset
+        # loss can be logged. Gated by env CT_DATASET_CHANNELS; datasets that already carry a `channel`
+        # column (e.g. the complete cls-json) are left as-is. All datasets end up with a `channel` column.
+        if os.environ.get('CT_DATASET_CHANNELS') and not streaming and train_dataset is not None:
+            from .ct_channels import ct_channel_for_path
+            _ct_ch = ct_channel_for_path(dataset_syntax.dataset)
+            if _ct_ch and 'channel' not in (getattr(train_dataset, 'features', None) or {}):
+                train_dataset = train_dataset.add_column('channel', [_ct_ch] * len(train_dataset))
         train_dataset, val_dataset = loader.post_process(
             train_dataset,
             dataset_sample=dataset_syntax.dataset_sample,

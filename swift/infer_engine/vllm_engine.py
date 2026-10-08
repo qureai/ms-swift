@@ -196,6 +196,9 @@ class VllmEngine(InferEngine):
             self.max_model_len = max_model_len
             logger.info(f'Setting max_model_len: {max_model_len}')
         self._prepare_engine_kwargs(max_model_len, engine_kwargs)
+        # 2D+3D CT checkpoints (config carries `vision_3d_config`) need a vLLM model subclass that
+        # builds + loads the secondary `visual_3d` tower. No-op for 2D-only checkpoints.
+        self._maybe_register_vision_3d()
         context = nullcontext()
         if is_torch_npu_available() and (tensor_parallel_size == 1 or pipeline_parallel_size == 1):
             colocate = (
@@ -209,6 +212,24 @@ class VllmEngine(InferEngine):
         self.patch_remove_log()
         self._request_count = 0
         self._prepare_reasoning_parser(reasoning_parser)
+
+    def _maybe_register_vision_3d(self) -> None:
+        """For any Qwen3.5 checkpoint, register the custom vLLM model subclass. It self-gates the
+        secondary CT tower on `vision_3d_config` (builds nothing 3D for a plain 2D model) and ignores
+        SFT-only auxiliary prefixes (`visual_3d.`, `asl_loss.`) that vanilla vLLM's strict loader would
+        reject. Backwards compatible: on a truly vanilla checkpoint it is behaviourally identical."""
+        try:
+            from transformers import AutoConfig
+            hf_config = AutoConfig.from_pretrained(self.model_id_or_path, trust_remote_code=True)
+        except Exception as e:  # noqa
+            logger.info(f'qwen3_5 vLLM: could not read config for {self.model_id_or_path} '
+                        f'({type(e).__name__}); skipping custom registration.')
+            return
+        archs = list(getattr(hf_config, 'architectures', None) or [])
+        if not any('Qwen3_5' in a for a in archs):
+            return
+        from swift.model.vision_3d.vllm_qwen3_5 import register_qwen3_5_3d_model
+        register_qwen3_5_3d_model()
 
     def _get_processor(self):
         return get_processor(

@@ -67,12 +67,22 @@ def conv2d_to_conv3d(conv2d: nn.Conv2d,
     return conv3d
 
 
-def reinit_conv3d_in_channels(conv3d: nn.Conv3d, in_channels: int) -> nn.Conv3d:
+def reinit_conv3d_in_channels(conv3d: nn.Conv3d, in_channels: int, patch_init: str = 'random') -> nn.Conv3d:
     """Return a fresh `nn.Conv3d` matching `conv3d`'s geometry but with `in_channels` inputs.
 
     Used when an already-3D encoder's native input-channel count differs from the CT windowing-channel
     count: the patch embed is reinitialised (and trained), while the rest of the encoder keeps its
     pretrained weights.
+
+    patch_init:
+      'random' (default, backwards-compatible): the new conv is left at PyTorch's default random init.
+         The pretrained downstream ViT blocks then receive out-of-distribution features until the input
+         layer learns -- slow, and (empirically) leaves the encoder near its init for thousands of steps.
+      'tile': WARM-START the new channels from the pretrained weights -- each new input channel is
+         initialised to the pretrained filters averaged over the source channels, rescaled by
+         (src_in / new_in) so the summed response magnitude is preserved. This keeps the patch-embed
+         output inside the distribution the pretrained blocks expect, so the pretrained encoder is
+         useful from step 0 instead of being stranded behind a random input layer.
     """
     new_conv = nn.Conv3d(
         in_channels,
@@ -82,7 +92,25 @@ def reinit_conv3d_in_channels(conv3d: nn.Conv3d, in_channels: int) -> nn.Conv3d:
         padding=conv3d.padding,
         bias=conv3d.bias is not None,
     )
-    return new_conv.to(device=conv3d.weight.device, dtype=conv3d.weight.dtype)
+    new_conv = new_conv.to(device=conv3d.weight.device, dtype=conv3d.weight.dtype)
+    if patch_init == 'tile':
+        with torch.no_grad():
+            src_in = conv3d.in_channels
+            w_mean = conv3d.weight.data.mean(dim=1, keepdim=True)  # (out,1,kt,kh,kw)
+            w_new = w_mean.repeat(1, in_channels, 1, 1, 1)
+            # Renormalize to the pretrained conv's TOTAL weight energy. Averaging over source channels and
+            # tiling shrinks the norm (~0.25x base); left uncorrected, the patch content is swamped by the
+            # inherited bias -> input-INDEPENDENT (constant) features (diagnosed root cause of zero grounding).
+            # Matching base energy, WITH the CT input standardized to ~unit-std (--ct_normalize standardize),
+            # restores the pretrained tower's weight-vs-bias balance so the patch embed responds to the volume.
+            base_norm = float(conv3d.weight.data.norm())
+            w_new = w_new * (base_norm / (float(w_new.norm()) + 1e-8))
+            new_conv.weight.data.copy_(w_new.to(new_conv.weight.dtype))
+            if new_conv.bias is not None and conv3d.bias is not None:
+                new_conv.bias.data.copy_(conv3d.bias.data.to(new_conv.bias.dtype))
+        logger.info(f'vision_3d: patch embed WARM-STARTED (tile) from pretrained {src_in}->{in_channels} channels '
+                    f'(mean-of-source filters, renormalized to base weight norm {base_norm:.3f}).')
+    return new_conv
 
 
 def _set_submodule(root: nn.Module, dotted_name: str, new_module: nn.Module) -> None:
@@ -98,14 +126,41 @@ def _set_submodule(root: nn.Module, dotted_name: str, new_module: nn.Module) -> 
         setattr(obj, last, new_module)
 
 
+def _sync_parent_in_channels(root: nn.Module, conv_dotted_name: str, in_channels: int) -> None:
+    """Sync an `in_channels`/`in_chans` attribute on the patch-embed conv's PARENT module.
+
+    Some towers keep the input-channel count on the module that WRAPS the conv and use it to reshape
+    the input before the conv, e.g. Qwen*VisionPatchEmbed:
+        hidden = hidden.view(-1, self.in_channels, temporal_patch_size, patch_size, patch_size)
+        hidden = self.proj(hidden)
+    Replacing only `self.proj` leaves `self.in_channels` stale, so that view splits the flattened
+    patches with the WRONG channel count (giving a bad row count downstream). Update it to match.
+    """
+    parts = conv_dotted_name.split('.')
+    parent = root
+    for p in parts[:-1]:
+        parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
+    parent_name = '.'.join(parts[:-1]) or '<root>'
+    for attr in ('in_channels', 'in_chans'):
+        if hasattr(parent, attr) and getattr(parent, attr) != in_channels:
+            setattr(parent, attr, in_channels)
+            logger.info(f'vision_3d: synced patch-embed parent `{parent_name}`.{attr} -> {in_channels} '
+                        'to match the reinitialised conv (used to reshape the input pre-conv).')
+
+
 def ensure_conv3d_patch_embed(tower: nn.Module,
                               *,
                               in_channels: int,
                               temporal_patch_size: int = 2,
-                              inflate: bool = True) -> bool:
+                              inflate: bool = True,
+                              patch_init: str = 'random') -> bool:
     """If `tower`'s patch-embed conv is 2D, replace it in-place with a 3D conv.
 
     Returns True if a swap happened, False if the tower was already 3D (or had no conv).
+
+    patch_init ('random'|'tile') controls how a CHANNEL-MISMATCH reinit is initialised: 'random' keeps
+    the current default; 'tile' warm-starts the new channels from the pretrained filters (see
+    `reinit_conv3d_in_channels`). Only affects the channel-mismatch reinit path (the native-3D CT case).
     """
     name, conv = find_patch_embed_conv(tower)
     if conv is None:
@@ -121,8 +176,9 @@ def ensure_conv3d_patch_embed(tower: nn.Module,
         # native 3D, but its input channels differ from the CT windowing-channel count -> reinit
         logger.info(f'vision_3d: patch embed `{name}` is Conv3d(in_channels={conv.in_channels}) but '
                     f'ct_num_channels={in_channels}; reinitialising the patch embed to {in_channels} channels '
-                    '(pretrained patch-embed weights dropped; rest of the encoder kept).')
-        _set_submodule(tower, name, reinit_conv3d_in_channels(conv, in_channels))
+                    f'(patch_init={patch_init}; rest of the encoder kept).')
+        _set_submodule(tower, name, reinit_conv3d_in_channels(conv, in_channels, patch_init=patch_init))
+        _sync_parent_in_channels(tower, name, in_channels)
         return True
 
     reuse = inflate and (conv.in_channels == in_channels)
@@ -132,4 +188,5 @@ def ensure_conv3d_patch_embed(tower: nn.Module,
     conv3d = conv2d_to_conv3d(
         conv, temporal_patch_size=temporal_patch_size, in_channels=in_channels, inflate=inflate)
     _set_submodule(tower, name, conv3d)
+    _sync_parent_in_channels(tower, name, in_channels)
     return True

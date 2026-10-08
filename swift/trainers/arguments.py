@@ -135,6 +135,46 @@ class TrainArgumentsMixin:
     router_aux_loss_coef: float = 0.
     enable_dft_loss: bool = False  # https://arxiv.org/abs/2508.05629
     enable_channel_loss: bool = False
+    # Asymmetric presence-boolean CE weighting, applied ONLY to samples whose `channel` == presence_ce_channel
+    # (e.g. the CLS-JSON roll-call dataset). At each presence value-token position (the `true`/`false` after a
+    # `"presence":` key) the LM cross-entropy is scaled: w_true for a `true` target, w_false for a `false`
+    # target. With w_true > w_false, predicting `false` for a GT-`true` finding is the hardest loss. The
+    # true/false token ids are derived from the live tokenizer at runtime (never hardcoded), so changing the
+    # base model just re-derives them. 1.0/1.0 leaves the loss untouched (feature off).
+    presence_ce_w_true: float = 1.0
+    presence_ce_w_false: float = 1.0
+    presence_ce_channel: str = 'cls_json'
+    # VICReg anti-collapse rank-reg on the 3D encoder's pre-projector tokens (backbone._rankreg_feats).
+    # lambda 0 => off (no compute). var floors each dim's std at gamma; cov (the operative term per the
+    # collapse diagnostic) decorrelates dims to raise effective rank. cov is computed on a token subsample.
+    vision_3d_rankreg_lambda: float = 0.0
+    vision_3d_rankreg_var_w: float = 1.0
+    vision_3d_rankreg_cov_w: float = 1.0
+    vision_3d_rankreg_gamma: float = 1.0
+    vision_3d_rankreg_max_tokens: int = 2048
+    # FAST-channel anti-collapse (post-proj <video> tokens). The fast tokens were observed to collapse to
+    # rank ~1 (norm exploding, reldiff dropping) while the pre-proj encoder stayed high-rank. These regularise
+    # the fast projection directly. All 0 => off (no compute).
+    vision_3d_rankreg_fast_lambda: float = 0.0   # VICReg var+cov on the post-proj fast tokens
+    vision_3d_proj_ortho_lambda: float = 0.0     # ||WᵀW-I|| on proj_fast Linears (keep full-rank, bound norm)
+    vision_3d_proj_fast_wd: float = 0.0          # L2 (weight-decay) on proj_fast weights (curb norm blow-up)
+    # ViT warmup-freeze: freeze the pretrained 3D encoder BLOCKS for the first N optimizer steps (the new
+    # adapter/patch-embed learn first, protecting the tower during the early window where collapse sets in).
+    # 0 => off. Applied via a callback that toggles requires_grad; the params stay in the optimizer.
+    vision_3d_vit_freeze_steps: int = 0
+    # Log the collapse detector (centered effective rank + top singular-value fraction of the pre-proj tokens
+    # that the forward ALREADY computed -> no extra forward). Tracks the 12->1 rank collapse from Phase-0.
+    log_collapse_metrics: bool = False
+    # Per-tag AUROC on the cls_json val set (teacher-forced P(true) at each presence boolean position),
+    # computed at every eval. Reuses the presence-weighting machinery (runtime true/false ids, channel gate).
+    # Needs per_device_eval_batch_size >= 2 (batch-1 eval compacts labels -> misaligned). Tags are scored by
+    # slot (order of appearance in the fixed roll-call); eval_cls_auc_tags optionally names the slots.
+    eval_cls_auc: bool = False
+    eval_cls_auc_tags: Optional[str] = None
+    # Log TRAIN token accuracy with Liger (Liger fuses CE -> no logits in training -> the built-in acc is
+    # eval-only). On logging steps only, compute acc from hidden_states[-1] + lm_head (chunked, bounded
+    # memory). Off by default (adds a full-vocab projection on logging steps).
+    log_train_acc: bool = False
     safe_serialization: bool = True
     max_shard_size: str = '5GB'
 

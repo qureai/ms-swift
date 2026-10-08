@@ -52,7 +52,8 @@ def load_vision_3d_source_model(model_id_or_path: str,
                                 trust_remote_code: bool = False,
                                 torch_dtype: Optional[torch.dtype] = None,
                                 use_hf: Optional[bool] = None,
-                                hub_token: Optional[str] = None) -> nn.Module:
+                                hub_token: Optional[str] = None,
+                                attn_impl: Optional[str] = None) -> nn.Module:
     """Load the source model that holds the 3D/vision encoder.
 
     Tries several Auto* classes in order so that both full VLMs and bare vision encoders load. The
@@ -76,6 +77,11 @@ def load_vision_3d_source_model(model_id_or_path: str,
             return build_atlas_vision_tower(path, config, torch_dtype=torch_dtype)
 
     common = dict(trust_remote_code=trust_remote_code, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
+    # Propagate --attn_impl to the 3D/vision encoder so Flash-Attention-2 (or sdpa) is used for its spatial
+    # attention -- the main-model flag does NOT reach this separately-loaded tower. ms-swift uses 'flash_attn'
+    # as the value; map it to the HF `attn_implementation` name. If a tower rejects the flag, we retry without.
+    if attn_impl:
+        common['attn_implementation'] = {'flash_attn': 'flash_attention_2'}.get(attn_impl, attn_impl)
 
     # For custom-code models, AutoModel + auto_map is the right entry. For standard VLMs, the
     # image-text-to-text / vision2seq classes expose the vision tower; AutoModel is the last resort.
@@ -92,9 +98,25 @@ def load_vision_3d_source_model(model_id_or_path: str,
         try:
             model = cls.from_pretrained(path, **common)
             logger.info(f'vision_3d: loaded source model `{model_id_or_path}` via {cls_name} '
-                        f'({model.__class__.__name__}).')
+                        f"(attn_implementation={common.get('attn_implementation', 'default')}, "
+                        f'{model.__class__.__name__}).')
             return model
         except Exception as e:  # noqa
+            # A tower that doesn't support the requested attn backend -> retry this class WITHOUT it before
+            # moving on, so --attn_impl flash_attention_2 never hard-fails the load (falls back to default).
+            if 'attn_implementation' in common:
+                try:
+                    fallback = {k: v for k, v in common.items() if k != 'attn_implementation'}
+                    model = cls.from_pretrained(path, **fallback)
+                    logger.info(f'vision_3d: loaded source model `{model_id_or_path}` via {cls_name} '
+                                f"(attn_implementation=default; requested {common['attn_implementation']} "
+                                f'rejected: {type(e).__name__}).')
+                    return model
+                except Exception as e2:  # noqa
+                    last_err = e2
+                    logger.info(f'vision_3d: {cls_name}.from_pretrained failed with and without attn_impl '
+                                f'({type(e2).__name__}); trying next.')
+                    continue
             last_err = e
             logger.info(f'vision_3d: {cls_name}.from_pretrained failed ({type(e).__name__}); trying next.')
     raise RuntimeError(f'vision_3d: could not load `{model_id_or_path}` with any Auto* class.') from last_err

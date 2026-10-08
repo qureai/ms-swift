@@ -78,19 +78,61 @@ class QwenVLVideoAdapter:
         grid_thw = torch.tensor([[gt, gh, gw]], dtype=torch.long, device=volume.device)
         return patches, grid_thw
 
-    def __call__(self, encoder, vols, max_tokens, grid=None, pool=True):
-        # pool=True -> mean-pool each volume to max_tokens and concat -> (n_vol * max_tokens, out_dim).
-        # pool=False -> return the FULL per-volume tokens (for the Perceiver resampler) -> (n_vol, M, out_dim).
+    @staticmethod
+    def _tower_tokens(out):
+        """Extract the post-merger vision tokens from the tower output (tensor / *WithPooling /
+        *WithDeepstackFeatures all expose pooler_output = the merged tokens)."""
+        tokens = getattr(out, 'pooler_output', None)
+        if tokens is None:
+            tokens = getattr(out, 'last_hidden_state', out)
+        return tokens
+
+    @staticmethod
+    def _tower_has_window_attention(encoder) -> bool:
+        """Qwen2.5-VL-style towers reorder ALL tokens into windows across the packed sequence (see
+        `get_window_index`), so a volume's features change with its batch-mates -> concatenating volumes
+        is NOT equivalent to encoding them alone. Qwen3-VL / Qwen3.5 towers have no window attention
+        (`window_size`/`fullatt_block_indexes` absent): attention is pure cu_seqlens block-diagonal and
+        rotary position ids reset per media, so batching IS equivalent. Detect the windowed case to guard."""
+        cfg = getattr(encoder, 'config', None)
+        if cfg is None:
+            return False
+        return bool(getattr(cfg, 'window_size', None)) or bool(getattr(cfg, 'fullatt_block_indexes', None))
+
+    def __call__(self, encoder, vols, max_tokens, grid=None, pool=True, variable=False):
+        # BATCHED by default for windowless towers (Qwen3-VL / Qwen3.5): concat every volume's patches into
+        # ONE forward with a multi-row grid_thw. The tower builds cu_seqlens from grid_thw so attention is
+        # block-diagonal per volume, and position ids reset per media -- so the output equals encoding each
+        # volume alone, but in a single tower forward (far better GPU utilisation than a per-volume Python
+        # loop). Windowed towers (Qwen2.5-VL) reorder tokens across the whole packed sequence and are NOT
+        # batch-equivalent -> fall back to the per-volume loop. (Atlas uses its own AtlasAdapter.)
+        # pool=True     -> mean-pool each volume to max_tokens, concat -> (n_vol * max_tokens, out_dim).
+        # pool=False    -> stack the FULL per-volume tokens (for the Perceiver resampler) -> (n_vol, M, out_dim).
+        # variable=True -> NO pooling/stacking: concat each volume's native (variable) token count
+        #                  -> (sum_i M_i, out_dim). Requires equal-M only when stacking, so variable is safe
+        #                  with differently-sized volumes (the variable-resolution CT path).
         from .backbone import pool_tokens_to
-        outs = []
-        enc_dtype = next(encoder.parameters()).dtype
-        for v in vols:  # (T, C, H, W)
-            patches, grid_thw = self._patchify(v)
-            out = encoder(patches.to(enc_dtype), grid_thw=grid_thw)
-            # Qwen-VL vision returns BaseModelOutputWithPooling: `pooler_output` is the post-merger
-            # tokens at out_hidden_size (the vision tokens fed to the LLM); prefer it, else fall back.
-            tokens = getattr(out, 'pooler_output', None)
-            if tokens is None:
-                tokens = getattr(out, 'last_hidden_state', out)
-            outs.append(pool_tokens_to(tokens, max_tokens) if pool else tokens)
+        enc = next(encoder.parameters())
+        enc_dtype, enc_device = enc.dtype, enc.device
+
+        if len(vols) > 1 and not self._tower_has_window_attention(encoder):
+            patches, grids = [], []
+            for v in vols:  # (T, C, H, W)
+                p, g = self._patchify(v.to(enc_device))
+                patches.append(p)
+                grids.append(g)
+            grid_thw = torch.cat(grids, dim=0)  # (n_vol, 3): one row per volume -> cu_seqlens isolates each
+            tokens = self._tower_tokens(encoder(torch.cat(patches, dim=0).to(enc_dtype), grid_thw=grid_thw))
+            m2 = self.merge_size**2
+            counts = [int(g[0, 0] * g[0, 1] * g[0, 2]) // m2 for g in grids]  # merged tokens per volume
+            per_vol = list(torch.split(tokens, counts, dim=0))
+        else:
+            per_vol = []
+            for v in vols:  # (T, C, H, W)
+                patches, grid_thw = self._patchify(v.to(enc_device))
+                per_vol.append(self._tower_tokens(encoder(patches.to(enc_dtype), grid_thw=grid_thw)))
+
+        if variable:
+            return torch.cat(per_vol, dim=0)  # (sum_i M_i, out_dim) -- native per-volume counts, no pooling
+        outs = [pool_tokens_to(t, max_tokens) if pool else t for t in per_vol]
         return torch.cat(outs, dim=0) if pool else torch.stack(outs, dim=0)

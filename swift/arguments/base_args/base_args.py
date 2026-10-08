@@ -370,6 +370,16 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
             self.vision_3d_max_tokens = saved.get('vision_3d_max_tokens')
         if saved.get('vision_3d_trust_remote_code'):
             self.vision_3d_trust_remote_code = True
+        # Slow-fast: the checkpoint's build geometry is authoritative. Restore it so the TEMPLATE expands the
+        # <video> placeholder to the FIXED fast_count the backbone emits. Without this, InferArguments(model=ckpt)
+        # rebuilds the slow-fast backbone (via vision_3d_config) but leaves the template in non-slowfast mode, so
+        # <video> expands to the full merged-token count while the backbone returns only fast_count tokens -> the
+        # splice's masked_scatter asserts (`totalElements <= srcSize` fails) on the first forward. No-op for
+        # non-slowfast checkpoints (slowfast_enabled falsy -> nothing changes).
+        if saved.get('slowfast_enabled'):
+            self.vision_3d_slowfast = True
+            if saved.get('fast_grid'):
+                self.vision_3d_fast_grid = saved['fast_grid']
         # CT data args -- needed so the template loads volumes with the SAME channel count / resolution
         # the encoder was trained on (a mismatch would break the patch-embed / masked_scatter shapes).
         if not getattr(self, 'ct_windows', None) and saved.get('ct_windows'):

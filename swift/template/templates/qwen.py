@@ -1421,19 +1421,18 @@ class Qwen2_5_VL_CT_Template(Volume3DTemplateMixin, Qwen2_5VLTemplate):
             if non_volume:
                 raise ValueError(f'{self.__class__.__name__} expects CT-volume <video> inputs (one of '
                                  f'{self.volume_extensions}); got non-volume video(s): {non_volume}.')
-            n_tokens = self.num_volume_tokens()
-            volumes = [self.load_volume(v) for v in inputs.videos]  # each (T, C, H, W), same size
-            pixel_values_volumes = torch.stack(volumes, dim=0)  # (n_vol, T, C, H, W)
-            # synthetic grid so rope assigns exactly n_tokens merged positions: prod([1,2,2N])//merge == N
-            video_grid_thw = torch.tensor([[1, 2, 2 * n_tokens]] * len(volumes), dtype=torch.long)
+            volumes = [self.load_volume(v) for v in inputs.videos]  # each (T,C,H,W); sizes may differ (variable)
+            # fixed: stack + constant count; variable: list + per-volume counts (capped at max_tokens).
+            pixel_values_volumes, video_grid_thw, token_lens = self._prepare_volumes(volumes)
             idx_list = findall(input_ids, self.video_token_id)
 
             def _volume_tokens(i):
-                return [self.video_token_id] * n_tokens
+                return [self.video_token_id] * token_lens[i]
 
             input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
                 input_ids, labels, loss_scale, idx_list, _volume_tokens, mm_mask=mm_mask)
             encoded['pixel_values_volumes'] = pixel_values_volumes
+            encoded['volume_uids'] = [self._volume_uid(v) for v in inputs.videos]
             encoded['video_grid_thw'] = video_grid_thw
             if self.version == 'v2_5':
                 encoded['second_per_grid_ts'] = [1.0] * len(volumes)
@@ -1492,18 +1491,17 @@ class Qwen3_VL_CT_Template(Volume3DTemplateMixin, Qwen3VLTemplate):
             if non_volume:
                 raise ValueError(f'{self.__class__.__name__} expects CT-volume <video> inputs (one of '
                                  f'{self.volume_extensions}); got non-volume video(s): {non_volume}.')
-            n_tokens = self.num_volume_tokens()
-            volumes = [self.load_volume(v) for v in inputs.videos]
-            pixel_values_volumes = torch.stack(volumes, dim=0)  # (n_vol, T, C, H, W)
-            video_grid_thw = torch.tensor([[1, 2, 2 * n_tokens]] * len(volumes), dtype=torch.long)
+            volumes = [self.load_volume(v) for v in inputs.videos]  # each (T,C,H,W); sizes may differ (variable)
+            pixel_values_volumes, video_grid_thw, token_lens = self._prepare_volumes(volumes)
             idx_list = findall(input_ids, self.video_token_id)
 
             def _volume_tokens(i):
-                return [self.video_token_id] * n_tokens
+                return [self.video_token_id] * token_lens[i]
 
             input_ids, labels, loss_scale, mm_mask = self._extend_tokens(
                 input_ids, labels, loss_scale, idx_list, _volume_tokens, mm_mask=mm_mask)
             encoded['pixel_values_volumes'] = pixel_values_volumes
+            encoded['volume_uids'] = [self._volume_uid(v) for v in inputs.videos]
             encoded['video_grid_thw'] = video_grid_thw
 
         encoded['input_ids'] = input_ids

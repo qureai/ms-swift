@@ -160,7 +160,11 @@ if __name__ == '__main__':
         install_requires=install_requires,
         extras_require=extra_requires,
         entry_points={
-            'console_scripts': ['swift=swift.cli.main:cli_main', 'megatron=swift.cli._megatron.main:cli_main']
+            'console_scripts': ['swift=swift.cli.main:cli_main', 'megatron=swift.cli._megatron.main:cli_main'],
+            # Registered in every vLLM process (incl. spawned EngineCore workers) so 2D+3D CT
+            # checkpoints get the visual_3d-aware model subclass. Self-gates on vision_3d_config,
+            # so it is a no-op for 2D-only checkpoints.
+            'vllm.general_plugins': ['swift_vision_3d=swift.model.vision_3d.vllm_qwen3_5:vllm_general_plugin'],
         },
         dependency_links=deps_link,
         zip_safe=False)

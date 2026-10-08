@@ -32,6 +32,7 @@ Example:
         --task autoreport --dataset-name ctrate --temperature 0.0
 """
 import argparse
+import json
 import os
 import secrets
 import sys
@@ -94,6 +95,49 @@ def save_buffer(rows: List[Dict[str, Any]], output_dir: Path, prefix: str) -> No
     print(f'Persisted {len(out_df)} rows -> {path}')
 
 
+def load_input_dataframe(path: str, image_column: str) -> pd.DataFrame:
+    """Load the eval set into a DataFrame keyed by the CT-volume path (`image_column`).
+
+    Supports:
+      * .parquet / .csv  -> read as-is (must already contain `image_column`).
+      * .json / .jsonl   -> ShareGPT-style records ({"videos": [...], "messages": [{"from","value"}]}),
+        as produced for the 13-Aug test sets. We take the CT volume (videos[0]) into `image_column` to
+        run inference on, and keep the record's `messages` verbatim (as a JSON string, for parquet safety)
+        so the reference conversation is saved alongside the model's output. The prompt actually sent to
+        the model is the chosen registry --prompt, not the row's own message.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ('.json', '.jsonl'):
+        return pd.read_csv(path) if ext == '.csv' else pd.read_parquet(path)
+
+    # These files may be a JSON array, a single object, or JSON-Lines (one object per line) -- the
+    # 13-Aug test sets are JSONL despite the .json extension. Try whole-file JSON first, fall back to JSONL.
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    try:
+        records = json.loads(text)
+        if isinstance(records, dict):
+            records = [records]
+    except json.JSONDecodeError:
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+
+    rows: List[Dict[str, Any]] = []
+    for rec in records:
+        videos = rec.get('videos')
+        # `videos` may be a bare path string OR a list of paths -> take the first volume either way.
+        if isinstance(videos, str):
+            vol = videos
+        elif isinstance(videos, (list, tuple)) and videos:
+            vol = videos[0]
+        else:
+            vol = None
+        rows.append({
+            image_column: vol,
+            'messages': json.dumps(rec.get('messages'), ensure_ascii=False),  # kept for reference
+        })
+    return pd.DataFrame(rows)
+
+
 def build_request(row: Dict[str, Any], args, InferRequest):
     """One InferRequest: system + '<prompt> <video>' with the volume on the videos channel."""
     messages = [
@@ -119,8 +163,8 @@ def main(args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f'Output dir: {output_dir}')
 
-    # --- Load & prepare dataset -------------------------------------------------
-    df = pd.read_csv(args.dataset) if args.dataset.endswith('.csv') else pd.read_parquet(args.dataset)
+    # --- Load & prepare dataset (parquet/csv, or ShareGPT .json/.jsonl test sets) ----------------
+    df = load_input_dataframe(args.dataset, args.image_column)
     if args.image_column not in df.columns:
         raise ValueError(f'--image-column {args.image_column!r} not in dataset columns: {list(df.columns)}')
     df = df[df[args.image_column].notna()].reset_index(drop=True)
@@ -197,11 +241,56 @@ def main(args) -> None:
         except Exception:  # noqa: BLE001 -- isolate the bad volume, keep the rest
             return [infer_one(r) for r in batch]
 
+    # ---- TWO-TURN inference (used when --prompt2 is set; e.g. cls -> report multiturn) -----------
+    def _turn1_messages() -> List[Dict[str, str]]:
+        return [{'role': 'system', 'content': args.system},
+                {'role': 'user', 'content': f'{args.prompt} <video>'}]
+
+    def infer_two_turn_one(row: Dict[str, Any]) -> Dict[str, Any]:
+        """turn1 = --prompt (with the volume); turn2 = --prompt2 with the volume + turn-1 answer in context."""
+        try:
+            vol = row[args.image_column]
+            m1 = _turn1_messages()
+            r1 = engine.infer([InferRequest(messages=list(m1), videos=[vol])],
+                              request_config)[0].choices[0].message.content
+            m2 = list(m1) + [{'role': 'assistant', 'content': r1}, {'role': 'user', 'content': args.prompt2}]
+            r2 = engine.infer([InferRequest(messages=m2, videos=[vol])],
+                              request_config)[0].choices[0].message.content
+            return {**row, 'query': args.prompt, 'query2': args.prompt2, 'response_turn1': r1,
+                    'response_turn2': r2, 'response': r2, 'status': 'success'}
+        except Exception as e:  # noqa: BLE001
+            return {**row, 'query': args.prompt, 'query2': args.prompt2, 'response_turn1': None,
+                    'response_turn2': None, 'response': f'ERROR: {e}', 'status': 'failure'}
+
+    def infer_two_turn_minibatch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Batched two-turn: run turn1 for the whole batch, then turn2 for the whole batch."""
+        if len(batch) == 1:
+            return [infer_two_turn_one(batch[0])]
+        try:
+            vols = [r[args.image_column] for r in batch]
+            m1 = _turn1_messages()
+            r1s = [x.choices[0].message.content for x in
+                   engine.infer([InferRequest(messages=list(m1), videos=[v]) for v in vols],
+                                request_config, use_tqdm=False)]
+            reqs2 = [InferRequest(messages=list(m1) + [{'role': 'assistant', 'content': r1},
+                                                       {'role': 'user', 'content': args.prompt2}], videos=[v])
+                     for r1, v in zip(r1s, vols)]
+            r2s = [x.choices[0].message.content for x in engine.infer(reqs2, request_config, use_tqdm=False)]
+            return [{**r, 'query': args.prompt, 'query2': args.prompt2, 'response_turn1': r1,
+                     'response_turn2': r2, 'response': r2, 'status': 'success'}
+                    for r, r1, r2 in zip(batch, r1s, r2s)]
+        except Exception:  # noqa: BLE001 -- isolate the bad volume, keep the rest
+            return [infer_two_turn_one(r) for r in batch]
+
+    process_minibatch = infer_two_turn_minibatch if args.prompt2 else infer_minibatch
+    if args.prompt2:
+        print(f'TWO-TURN mode: turn1={args.prompt!r} | turn2={args.prompt2!r}')
+
     try:
         with tqdm(total=len(rows), desc='Inferring', unit='vol') as pbar:
             for start in range(0, len(rows), args.max_batch_size):
                 batch = rows[start:start + args.max_batch_size]
-                for res in infer_minibatch(batch):
+                for res in process_minibatch(batch):
                     if res.pop('status') == 'success':
                         buffer.append(res)
                         success += 1
@@ -225,7 +314,11 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, required=True, help='Input CSV/Parquet dataset')
     parser.add_argument('--image-column', type=str, default='volume_uri',
                         help='Column holding the CT volume path (local / s3:// / .nii/.npy/DICOM-dir)')
-    parser.add_argument('--prompt', type=str, required=True, help='Prompt/question for the model')
+    parser.add_argument('--prompt', type=str, required=True, help='Prompt/question for the model (turn 1)')
+    parser.add_argument('--prompt2', type=str, default=None,
+                        help='Optional second-turn prompt. If set, runs TWO-TURN inference: turn1=--prompt '
+                             '(with the volume), then turn2=--prompt2 with the volume + turn-1 answer in '
+                             'context. Output adds response_turn1/response_turn2 (response = turn2).')
     parser.add_argument('--model', type=str, required=True, help='Checkpoint path (dir with args.json/config.json)')
     parser.add_argument('--output-dir', type=str, required=True,
                         help='Base dir; a task_{TASK}_temperature_{TEMP}_dataset_{NAME} subdir is created under it')

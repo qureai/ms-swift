@@ -113,10 +113,58 @@ class ModelArguments:
     vision_3d_trust_remote_code: bool = False
     vision_3d_module_path: Optional[str] = None
     vision_3d_inflate_weights: bool = True
+    # vision_3d_patch_init: how the reinitialised (channel-mismatch) 3D patch embed is initialised.
+    #   'random' (default): PyTorch default init -- the pretrained ViT blocks are then fed OOD features
+    #     until the input layer learns (slow; encoder stays near init for a long time).
+    #   'tile': warm-start the new CT-window channels from the pretrained filters (mean-of-source, rescaled)
+    #     so the pretrained encoder is useful from step 0.
+    vision_3d_patch_init: Literal['random', 'tile'] = 'random'
     vision_3d_max_tokens: Optional[int] = None
     vision_3d_resampler: Literal['none', 'perceiver'] = 'none'
     vision_3d_resampler_depth: int = 2
     vision_3d_resampler_heads: int = 8
+    # vision_3d_sta: inject Spatial-Temporal Attention (temporal/z-axis self-attention) into each Qwen-VL
+    # vision block. Off by default (feature is fully backwards-compatible). Qwen-VL 3D encoder only.
+    # vision_3d_sta_num_temporal_heads: temporal-attention heads; None => round(spatial_heads * 0.25).
+    # vision_3d_sta_window: temporal-attention locality. 0 (default) => full z attention (each slice-group
+    #   attends to ALL others); k>0 => band-diagonal local attention over +/- k groups (less rank pressure).
+    vision_3d_sta: bool = False
+    vision_3d_sta_num_temporal_heads: Optional[int] = None
+    vision_3d_sta_window: int = 0
+    # --- Slow-Fast tokens (opt-in; default OFF => current behaviour exactly) ---
+    # vision_3d_slowfast: master switch. FAST tokens (avg+max 3D pool to a fixed grid) ride the <video>
+    #   channel; SLOW tokens (full encoder tokens) feed cross-attention into the LLM (wired in a later step).
+    # vision_3d_fast_grid: "Tf,Hf,Wf" fixed fast grid => fast_count = Tf*Hf*Wf per volume.
+    # vision_3d_fast_pool: 'avg' | 'max' | 'avgmax' (avgmax => proj_fast input dim = 2*enc_dim).
+    # vision_3d_slow_max_tokens: cap on the slow-token count (K/V memory) for the cross-attention.
+    vision_3d_slowfast: bool = False
+    vision_3d_fast_grid: str = '4,8,8'
+    vision_3d_fast_pool: Literal['avg', 'max', 'avgmax'] = 'avgmax'
+    vision_3d_slow_max_tokens: int = 4096
+    # vision_3d_crossattn_every_n: insert the gated cross-attention on every N-th FULL-attention decoder
+    #   layer (1 => all full-attn layers). Cross-attn params train at the base --learning_rate (they live in
+    #   the LLM), are zero-gated at init (identity), and are saved in the main model state_dict.
+    vision_3d_crossattn_every_n: int = 2
+    # --- Training recipe (anti-collapse; Phase-0 diagnostic). All default to CURRENT behaviour. ---
+    # vision_3d_proj_zero_init: zero-init the projector's OUTPUT Linear (proj[-1], and proj_fast[-1]) so at
+    #   step 0 no gradient flows into the encoder through the projector (the tower is protected while the
+    #   projector finds a sane map). On resume the trained weights overwrite the zeros.
+    # vision_3d_split_lr_groups: register the NEW adapter params (proj, proj_fast, cross_blocks) under the
+    #   `aligner` optimizer group so they train at --aligner_lr (HIGH), while the pretrained encoder stays in
+    #   the `vit` group at --vit_lr (LOW). Off => everything stays in the vit group (current behaviour).
+    vision_3d_proj_zero_init: bool = False
+    # FAST projector output init: '' (follow proj_zero_init), 'zero', 'orthogonal' (full-rank start -- avoids
+    # seeding the rank-1 fast-channel collapse), or 'default' (leave framework init).
+    vision_3d_proj_fast_init: str = ''
+    vision_3d_split_lr_groups: bool = False
+    # Auxiliary ML-Decoder multi-label head on the (pre-projector) 3D encoder tokens, trained with
+    # Asymmetric Loss to force per-volume grounding (a constant feature cannot minimise it). Off by
+    # default (lambda 0). lambda scales the aux loss added to the LM loss. The label table maps
+    # series_uid -> present-tag indices; tags file is the ordered class list (== head num_classes).
+    # Volumes whose uid is not in the table are masked out of the aux loss.
+    vision_3d_aux_mldecoder_lambda: float = 0.0
+    vision_3d_aux_label_table: Optional[str] = None
+    vision_3d_aux_tags: Optional[str] = None
 
     def _init_device_map(self):
         """Prepare device map args"""

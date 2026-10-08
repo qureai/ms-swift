@@ -1105,6 +1105,10 @@ def finish_vllm_weight_reload(vllm_model):
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
     except (ImportError, AttributeError):
         return  # vLLM is too old to have FusedMoE; nothing to fix.
+    if not isinstance(FusedMoE, type):
+        # Some vLLM builds (e.g. 0.26 with Triton disabled) expose `FusedMoE` as a
+        # None/stub rather than a class; a dense model has no MoE layers to fix anyway.
+        return
     logger = get_logger()
     for module in vllm_model.modules():
         if not isinstance(module, FusedMoE):

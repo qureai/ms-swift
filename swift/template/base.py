@@ -102,7 +102,14 @@ class Template(ProcessorMixin):
         ct_volume_size: Optional[str] = None,
         ct_augment: bool = False,
         ct_augment_prob: float = 0.15,
+        ct_load_dtype: str = 'float32',
+        ct_normalize: str = 'none',
         vision_3d_max_tokens: Optional[int] = None,
+        vision_3d_slowfast: bool = False,
+        vision_3d_fast_grid: str = '4,8,8',
+        vision_3d_patch_size: Optional[int] = None,
+        vision_3d_temporal_patch_size: Optional[int] = None,
+        vision_3d_merge_size: Optional[int] = None,
     ) -> None:
         """
         default_system: Override the default_system in the template.
@@ -141,7 +148,19 @@ class Template(ProcessorMixin):
         self.ct_volume_size = ct_volume_size
         self.ct_augment = ct_augment
         self.ct_augment_prob = ct_augment_prob
+        self.ct_load_dtype = ct_load_dtype
+        self.ct_normalize = ct_normalize
         self.vision_3d_max_tokens = vision_3d_max_tokens
+        # slow-fast: when on, a volume's <video> placeholder expands to the FIXED fast_count (= prod(fast_grid))
+        # instead of its native token count; the encoder still gets the full volume (for the slow branch).
+        self.vision_3d_slowfast = bool(vision_3d_slowfast)
+        _fg = vision_3d_fast_grid.split(',') if isinstance(vision_3d_fast_grid, str) else vision_3d_fast_grid
+        self.vision_3d_fast_count = int(int(_fg[0]) * int(_fg[1]) * int(_fg[2])) if self.vision_3d_slowfast else None
+        # 3D-encoder patch geometry (from --vision_3d_model's config); used by variable-resolution CT so it
+        # works with any Qwen vision tower. None -> fall back to the host processor geometry.
+        self.vision_3d_patch_size = vision_3d_patch_size
+        self.vision_3d_temporal_patch_size = vision_3d_temporal_patch_size
+        self.vision_3d_merge_size = vision_3d_merge_size
         self.chat_template_kwargs = {}
         self.remove_unused_columns = remove_unused_columns
         self.template_backend = template_backend
@@ -1604,7 +1623,7 @@ class Template(ProcessorMixin):
         for k, v in old_kwargs.items():
             if k in {
                     'input_ids', 'attention_mask', 'labels', 'position_ids', 'output_hidden_states', 'logits_to_keep',
-                    'max_length_q', 'max_length_k', 'cu_seq_lens_q', 'cu_seq_lens_k', 'mm_token_type_ids'
+                    'max_length_q', 'max_length_k', 'cu_seq_lens_q', 'cu_seq_lens_k', 'mm_token_type_ids', 'skip_logits'
             } and k not in kwargs:
                 kwargs[k] = v
         if 'inputs_embeds' in kwargs:

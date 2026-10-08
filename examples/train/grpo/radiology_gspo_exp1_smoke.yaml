@@ -1,0 +1,62 @@
+# SMOKE for exp1_24sep: validates (1) vLLM loads on H100 with FA2 (VLLM_FORCE_FA2=1, no FA3 PTX crash),
+# (2) a few GRPO steps run, (3) all reward components log to wandb. Tiny + short (backfill-friendly).
+# Real run: radiology_gspo_exp1_24sep.yaml.
+model: /cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/vlm_ckpts/Qwen3.5-2B_stage6b_alltools/v0-20260906-173237/checkpoint-608
+torch_dtype: bfloat16
+tuner_type: full
+attn_impl: sdpa
+template: qwen3_5
+
+rlhf_type: grpo
+external_plugins:
+  - examples/train/grpo/plugin/radiology_reward.py
+reward_funcs:
+  - radiology
+reward_embedding_model: /cache/fast_data_nas71/janhavi/vlm_ckpts/qwen3_4b_embedding/23_sep_qwen3_4b_cross_axis_v1/checkpoints/checkpoint-900
+scale_rewards: group
+
+dataset:
+  - /cache/fast_data_nas71/janhavi/data/rl_training/exp1/exp1_easy.parquet
+dataset_shuffle: true          # smoke: shuffle to touch a mix of tasks in the first few steps
+split_dataset_ratio: 0.0
+max_length: 8192
+
+importance_sampling_level: sequence
+beta: 0.0
+epsilon: 3e-4
+epsilon_high: 4e-4
+num_generations: 8
+steps_per_generation: 8
+num_iterations: 1
+dynamic_sample: false          # smoke: keep it simple/fast
+
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.2   # L40S: small KV pool (4B embedder + zero2_offload resident)
+vllm_enforce_eager: true
+vllm_max_model_len: 4096
+vllm_limit_mm_per_prompt: '{"image": 1}'
+sleep_level: 1
+max_completion_length: 512     # short completions -> fast smoke
+temperature: 1.0
+top_p: 0.9
+top_k: 20
+
+max_steps: 4                   # SMOKE: stop after 4 optimizer steps
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 1e-6
+warmup_ratio: 0.0
+deepspeed: zero2_offload   # zero2 + optimizer->CPU offload: frees GPU so 2B-train + 4B embedder + vLLM fit L40S
+gradient_checkpointing: true   # cut activation memory (2048-tok completions + vision tokens)
+
+output_dir: /cache/fast_data_nas71/janhavi/data/rl_training/output/exp1_smoke
+run_name: exp1_smoke_fa2
+save_steps: 10000              # don't checkpoint in the smoke
+save_total_limit: 1
+logging_steps: 1              # log every step so reward components show up immediately
+log_completions: true
+report_to:
+  - tensorboard
+  - wandb
+dataloader_num_workers: 2

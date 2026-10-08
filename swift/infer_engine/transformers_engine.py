@@ -278,7 +278,11 @@ class TransformersEngine(InferEngine):
             except StopIteration:
                 all_is_finished = True
 
-            batched_generate_ids = self.template.get_generate_ids(raw_batched_generate_ids, num_prompt_tokens)
+            # inputs_embeds generation (multimodal) -> `generate` streams only new tokens (no prompt
+            # prefix), so don't strip num_prompt_tokens or we chop the response front. Only strip for the
+            # input_ids path where sequences = prompt + response.
+            gen_offset = num_prompt_tokens if 'input_ids' in inputs else 0
+            batched_generate_ids = self.template.get_generate_ids(raw_batched_generate_ids, gen_offset)
             self._update_batched_logprobs(batched_logprobs, logits_streamer, batched_generate_ids,
                                           request_config.top_logprobs)
 
@@ -409,7 +413,12 @@ class TransformersEngine(InferEngine):
         output = dict(self.template.generate(self.model, **generate_kwargs))
         output.pop('past_key_values', None)
         batched_generate_ids = output['sequences']
-        batched_generate_ids = self.template.get_generate_ids(batched_generate_ids, num_prompt_tokens)
+        # When generation runs from `inputs_embeds` (multimodal: pre_forward_hook pops input_ids), HF's
+        # `generate` returns ONLY the newly generated tokens -- no prompt prefix in `sequences`. Stripping
+        # num_prompt_tokens then eats the first tokens of the response. Only strip when input_ids was the
+        # generation input (sequences = prompt + response). See CT `<video>` front-truncation bug.
+        gen_offset = num_prompt_tokens if 'input_ids' in inputs else 0
+        batched_generate_ids = self.template.get_generate_ids(batched_generate_ids, gen_offset)
         self.template.debug_logger({'generate_ids': batched_generate_ids})  # debug
         batched_logprobs = self.preprocess_logits(
             output.get('logits'), batched_generate_ids, request_config.top_logprobs)
