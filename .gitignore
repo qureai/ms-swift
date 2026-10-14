@@ -152,6 +152,7 @@ megatron_output/
 # Pytorch
 *.pth
 *.pt
+*.err
 
 # ast template
 ast_index_file.py

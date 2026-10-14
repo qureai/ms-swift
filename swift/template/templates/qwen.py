@@ -1390,6 +1390,17 @@ class Qwen2_5_VL_CT_Template(Volume3DTemplateMixin, Qwen2_5VLTemplate):
         # Intercept CT-volume videos before Qwen's fetch_video; keep the path for _encode to load.
         if media_type == 'video' and self.is_volume_path(inputs.videos[index]):
             return ['<|vision_start|><|video_pad|><|vision_end|>']
+        patch_size = self.processor.image_processor.patch_size
+        if media_type == 'image' and patch_size != 14:
+            # Qwen3.x processor (patch 16) on this v2_5 template: the base path resizes to multiples of 28, but
+            # _encode calls the image processor with do_resize=False -> resize to multiples of patch*merge here.
+            from qwen_vl_utils import fetch_image
+            inputs.images[index] = fetch_image({
+                'image': inputs.images[index],
+                **inputs.chat_template_kwargs
+            },
+                                               image_patch_size=patch_size)
+            return ['<|vision_start|><|image_pad|><|vision_end|>']
         return super().replace_tag(media_type, index, inputs)
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:

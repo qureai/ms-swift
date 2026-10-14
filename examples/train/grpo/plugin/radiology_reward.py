@@ -197,6 +197,19 @@ class RewardConfig:
     lambda_min: float = 0.0
     lambda_max: float = 1.0
 
+    # --- subtype partial credit -------------------------------------------------------------------
+    # alpha in [0,1]: a predicted tag in the SAME clinical family as a GT tag (but not exact) scores
+    # `subtype_credit`*weight on recall/Tversky instead of 0 (a miss) + is a reduced (alpha) FP instead
+    # of a full one. 0 (default) = exact-match only (legacy). Family map from RADREWARD_FAMILIES json.
+    subtype_credit: float = 0.0
+
+    # --- group-relative embedding ------------------------------------------------------------------
+    # When on, each rollout's embedding sub-reward is re-expressed as a WITHIN-GROUP z-score (rollouts
+    # sharing a prompt = same reference+task). GSPO extracts gradient from within-group variance, so an
+    # absolute embedding score that is ~flat across the group (e.g. all ~0.80) yields no gradient; the
+    # z-score restores it by rewarding the group's best report. Off (default) = absolute (cos+1)/2.
+    emb_group_relative: bool = False
+
     # --- grouping ---
     num_generations: int = 8
 
@@ -212,6 +225,9 @@ class RewardConfig:
         self.w_recall = _f('RADREWARD_W_RECALL', self.w_recall)
         self.w_precision = _f('RADREWARD_W_PRECISION', self.w_precision)
         self.w_emb = _f('RADREWARD_W_EMB', self.w_emb)         # base embedding weight (env-tunable)
+        self.subtype_credit = _f('RADREWARD_SUBTYPE_CREDIT', self.subtype_credit)  # family partial credit alpha
+        self.emb_group_relative = _os.getenv('RADREWARD_EMB_GROUPREL',
+                                             '1' if self.emb_group_relative else '0') == '1'
         self.w_cal = _f('RADREWARD_W_CAL', self.w_cal)
         self.cal_true_weight = _f('RADREWARD_TRUE_WEIGHT', self.cal_true_weight)
         self.w_attr = _f('RADREWARD_W_ATTR', self.w_attr)
@@ -277,6 +293,22 @@ def load_vocab() -> Set[str]:
     logger.warning('RADREWARD_VOCAB not set; using the built-in default abnormality vocabulary. '
                    'Set it to your real CLS label space so specificity/Hamming are correct.')
     return {_norm_tag(x) for x in _DEFAULT_VOCAB}
+
+
+def load_families() -> Dict[str, frozenset]:
+    """{normalized_tag: frozenset(families)} for subtype partial credit. A tag may be in MULTIPLE families
+    (e.g. mediastinal_mass -> {mass, mediastinal}); two tags are related if their family sets intersect.
+    Accepts json values that are a list of families or a single string. From RADREWARD_FAMILIES, else {}."""
+    path = os.getenv('RADREWARD_FAMILIES')
+    if path and os.path.exists(path):
+        with open(path) as f:
+            raw = json.load(f)
+        out = {}
+        for k, v in raw.items():
+            fams = v if isinstance(v, (list, tuple, set)) else [v]
+            out[_norm_tag(k)] = frozenset(str(x) for x in fams)
+        return out
+    return {}
 
 
 # ----------------------------------------------------------------------------- #
@@ -418,11 +450,42 @@ class ParsedReport:
 
 
 _CLS_TOKEN_RE = re.compile(r'<([A-Za-z_][A-Za-z0-9_]*)>')
+# ASP block markers in every form seen in rollouts: special tokens |<ASP>| / |</ASP>|, the legacy
+# string <|ASP|> (and </|ASP|>), and the malformed close <|/ASP>| that SFT sometimes writes. The
+# special-token form contains '<ASP>', which _CLS_TOKEN_RE would otherwise read as a finding 'asp'.
+_ASP_MARK_RE = re.compile(r'\|</?ASP>\||</?\|ASP\|>|<\|/ASP>\|')
+_ASP_OPEN_ANY_RE = re.compile(r'\|<ASP>\||<\|ASP\|>')
+_ASP_ANY_CLOSE_RE = re.compile(r'\|</ASP>\||</\|ASP\|>|<\|/ASP>\|')
+_CLS_TAG_UPPER_RE = re.compile(r'<[A-Z][A-Z0-9_]*>')          # a real cls_tokens tag, e.g. <PLEURAL_EFFUSION>
+_JSON_START_RE = re.compile(r'\n\s*\{\s*"')
+
+
+def has_cls_tag_tokens(text: str) -> bool:
+    """True if `text` contains at least one cls_tokens tag (<UPPER_SNAKE>), ignoring ASP markers.
+    False for an empty answer, an ASP-only answer, or an ontology/JSON report written instead of tags."""
+    return bool(_CLS_TAG_UPPER_RE.search(_ASP_MARK_RE.sub(' ', text or '')))
+
+
+def asp_block_span(text: str) -> Optional[Tuple[int, int]]:
+    """(start, end) character span of the ASP block, or None if the text has no ASP opening marker.
+    Ends at the closing marker when present; otherwise (legacy <|ASP|> has no close, or the block was
+    truncated) at the first cls_tokens tag or JSON object after the opening, else end of text."""
+    t = text or ''
+    mo = _ASP_OPEN_ANY_RE.search(t)
+    if not mo:
+        return None
+    ends = [len(t)]
+    for rx in (_ASP_ANY_CLOSE_RE, _CLS_TAG_UPPER_RE, _JSON_START_RE):
+        m = rx.search(t, mo.end())
+        if m:
+            ends.append(m.end() if rx is _ASP_ANY_CLOSE_RE else m.start())
+    return mo.start(), min(ends)
 
 
 def parse_cls_tokens(text: str) -> ParsedReport:
-    """Parse the cls_tokens output `<PLEURAL_EFFUSION> <CONSOLIDATION> ...` into a report."""
-    labels = {_norm_tag(t) for t in _CLS_TOKEN_RE.findall(text or '')}
+    """Parse the cls_tokens output `<PLEURAL_EFFUSION> <CONSOLIDATION> ...` into a report.
+    ASP markers are stripped first so the |<ASP>| special token is not counted as a finding."""
+    labels = {_norm_tag(t) for t in _CLS_TOKEN_RE.findall(_ASP_MARK_RE.sub(' ', text or ''))}
     findings = [Finding(label=l) for l in sorted(labels)]
     return ParsedReport(ok=isinstance(text, str), present=set(labels), findings=findings,
                         findings_text=_render_findings(findings),
@@ -720,6 +783,10 @@ class RadiologyReportReward(ORM):
         self._lam_P = self.cfg.w_precision
         self.gt_key = os.getenv('RADREWARD_GT_KEY', 'solution')
         self.vocab = load_vocab()
+        self.families = load_families()                  # {tag: family} for subtype partial credit ({} = off)
+        if self.families and self.cfg.subtype_credit > 0:
+            logger.info('subtype partial credit ON: alpha=%.2f, %d tags across %d families',
+                        self.cfg.subtype_credit, len(self.families), len(set(self.families.values())))
         # embedding model path: swift arg --reward_embedding_model, else env var.
         # If neither is given, the embedding sub-reward is disabled (no embedder).
         emb_path = getattr(args, 'reward_embedding_model', None) or os.getenv('RADREWARD_EMBED_MODEL')
@@ -750,6 +817,31 @@ class RadiologyReportReward(ORM):
             self._bool_ids = (frozenset(), frozenset())
         return self._bool_ids
 
+    def _match_weights(self, pred_set, gt_set, wfn):
+        """Weighted TP/GT + FP counts between a predicted and a GT tag set, with family partial credit.
+        Returns (W_tp, W_gt, fp_full, fp_partial). Exact matches score full weight; with subtype_credit
+        alpha>0, a GT tag missed exactly but whose clinical family IS predicted scores alpha*weight (and
+        such a predicted tag is an alpha-FP, counted in fp_partial, not fp_full). alpha=0 -> exact only."""
+        a = self.cfg.subtype_credit
+        W_gt = sum(wfn(g) for g in gt_set)
+        W_tp = sum(wfn(f) for f in (pred_set & gt_set))
+        fp = pred_set - gt_set
+        if a > 0 and self.families:
+            fam = lambda t: self.families.get(t) or frozenset()   # tag -> set of families ({} if none)
+            pred_fams = set()
+            for p in pred_set:
+                pred_fams |= fam(p)
+            gt_fams = set()
+            for g in gt_set:
+                gt_fams |= fam(g)
+            # a missed GT tag gets partial credit if ANY of its families is among the predicted families
+            W_tp += a * sum(wfn(g) for g in (gt_set - pred_set) if fam(g) & pred_fams)
+            fp_part = sum(1 for p in fp if fam(p) & gt_fams)     # a near-miss pred (shares a GT family)
+            fp_full = len(fp) - fp_part
+        else:
+            fp_full, fp_part = len(fp), 0
+        return W_tp, W_gt, fp_full, fp_part
+
     # -- CLS: PROMINENCE-WEIGHTED sens/spec (Youden) + asymmetric Tversky, [0,1] --- #
     def _cls_reward(self, pred: ParsedReport, gt: ParsedReport) -> Tuple[float, float, float, float]:
         """Return (reward in [0,1], sensitivity, specificity, youden).
@@ -768,20 +860,20 @@ class RadiologyReportReward(ORM):
             p = gt.prominence.get(f)
             return (p / 5.0) if p else c.prom_default
 
-        W_tp = sum(w(f) for f in (pred_v & gt_p))
-        W_fn = sum(w(f) for f in (gt_p - pred_v))
-        W_gt = W_tp + W_fn
-        fp_v = len(pred_v - gt_p)
+        # prominence-weighted recall, with SUBTYPE partial credit (alpha): a predicted tag in the same
+        # clinical family as a missed GT tag scores alpha*w instead of 0 and is an alpha-FP not a full FP.
+        W_tp, W_gt, fp_full, fp_part = self._match_weights(pred_v, gt_p, w)
+        fp_v = fp_full + fp_part                         # (spec is unused when cls_w_spec=0)
 
-        sens = (W_tp / W_gt) if W_gt > 0 else 1.0        # prominence-weighted recall
+        sens = (W_tp / W_gt) if W_gt > 0 else 1.0        # prominence-weighted recall (partial-credited)
         tn = V - len(gt_p | pred_v)
         spec = tn / (tn + fp_v) if (tn + fp_v) > 0 else 1.0
         youden = sens + spec - 1.0
 
-        # asymmetric Tversky, prominence-weighted (FP incl. out-of-vocab, default weight)
-        W_tp_all = sum(w(f) for f in (pred.present & gt.present))
-        W_fn_all = sum(w(f) for f in (gt.present - pred.present))
-        W_fp_all = c.prom_default * len(pred.present - gt.present)
+        # asymmetric Tversky over the FULL present sets, same partial-credit (FP incl. out-of-vocab).
+        W_tp_all, W_gt_all, fpf_all, fpp_all = self._match_weights(pred.present, gt.present, w)
+        W_fn_all = W_gt_all - W_tp_all
+        W_fp_all = c.prom_default * (fpf_all + c.subtype_credit * fpp_all)
         denom = W_tp_all + c.tversky_fn * W_fn_all + c.tversky_fp * W_fp_all
         tversky = W_tp_all / denom if denom > 0 else 1.0
 
@@ -923,6 +1015,31 @@ class RadiologyReportReward(ORM):
             out[i] = (num / den) if den > 0 else None
         return out
 
+    @staticmethod
+    def _group_relative(emb: List[Optional[float]], keys: List) -> List[Optional[float]]:
+        """Re-express each rollout's embedding score as a within-GROUP z-score mapped to [0,1], so GSPO
+        sees variance (and thus gradient) from embedding even when the group's absolute cosines are ~flat.
+        Rollouts sharing a key (same prompt = reference+task) form a group; a group with <2 scorable
+        rollouts or ~zero spread keeps the absolute score (don't amplify pure noise)."""
+        groups: Dict = {}
+        for i, k in enumerate(keys):
+            if emb[i] is not None:
+                groups.setdefault(k, []).append(i)
+        out = list(emb)
+        for idxs in groups.values():
+            if len(idxs) < 2:
+                continue
+            vals = [emb[i] for i in idxs]
+            m = sum(vals) / len(vals)
+            var = sum((v - m) ** 2 for v in vals) / len(vals)
+            sd = var ** 0.5
+            if sd < 1e-6:
+                continue
+            for i in idxs:
+                z = (emb[i] - m) / sd
+                out[i] = min(1.0, max(0.0, 0.5 + 0.25 * z))   # z in [-2,2] -> [0,1], centered at 0.5
+        return out
+
     # -- CONSISTENCY (NEW): impression must not invent findings ----------------- #
     def _mentions(self, text: Optional[str]) -> Set[str]:
         """Vocabulary labels whose words all appear in the text (rough mention detector)."""
@@ -1004,6 +1121,10 @@ class RadiologyReportReward(ORM):
         true_ids, false_ids = self._get_bool_ids() if use_cal else (frozenset(), frozenset())
 
         emb = self._embedding_rewards(preds, gts)        # per-rollout [0,1] or None
+        if c.emb_group_relative:                         # z-score embedding within each prompt-group
+            grp_keys = [(refs[i], _norm_tag(tasks[i] or '')) if refs[i] is not None else ('__noref__', i)
+                        for i in range(n)]
+            emb = self._group_relative(emb, grp_keys)
 
         rewards = []
         comp = {k: [] for k in ('cls', 'bbox', 'token', 'embedding', 'consistency', 'format',
@@ -1725,6 +1846,42 @@ class RadiologyRouter(ORM):
         # (product^(1/n)) and 'min' both collapse the compound reward toward 0 if ANY sub-task is
         # neglected, so every sub-task must stay up. 1_oct uses geomean. (RADREWARD_COMPOUND_AGG)
         self._agg_mode = os.getenv('RADREWARD_COMPOUND_AGG', 'mean')
+        # cls_tokens format enforcement: a cls_tokens answer (or the cls_tokens segment of a compound
+        # rollout) with NO <TAG> tokens -- empty, ASP-only, or an ontology/JSON report written instead --
+        # has its cls_tokens score multiplied by this. 1.0 = off. Without it an empty answer scores ~0.94
+        # on normal studies (GT <NORMAL>), so "say nothing" is nearly optimal there.
+        self._notag_mult = float(os.getenv('RADREWARD_CLS_NOTAG_MULT', '1.0') or 1.0)
+        # ASP length penalty (hinge): rows whose subtasks include one of RADREWARD_ASP_PEN_TASKS get their
+        # total reward multiplied by 1 - MAX * min(1, max(0, L_asp - FREE) / RAMP), L_asp = ASP block
+        # tokens. An ASP block under FREE tokens is free (ties with no ASP), so the group-relative
+        # advantage pushes long blocks shorter without pushing ASP to zero. MAX=0 = off.
+        self._asp_pen_max = float(os.getenv('RADREWARD_ASP_PEN_MAX', '0') or 0.0)
+        self._asp_free = float(os.getenv('RADREWARD_ASP_FREE_TOK', '1500') or 1500)
+        self._asp_ramp = max(1.0, float(os.getenv('RADREWARD_ASP_RAMP_TOK', '2500') or 2500))
+        self._asp_pen_tasks = {_norm_tag(s) for s in os.getenv('RADREWARD_ASP_PEN_TASKS', 'cls_tokens').split(',')
+                               if s.strip()}
+        if self._notag_mult < 1.0 or self._asp_pen_max > 0:
+            logger.info(f'radiology router: cls_tokens no-tag mult={self._notag_mult} | ASP length penalty '
+                        f'max={self._asp_pen_max} free={self._asp_free:.0f} ramp={self._asp_ramp:.0f} '
+                        f'tasks={sorted(self._asp_pen_tasks)}')
+
+    def _asp_tokens(self, text: str) -> int:
+        """Token length of the ASP block in `text` (0 if none), with the policy tokenizer when available."""
+        span = asp_block_span(text)
+        if span is None:
+            return 0
+        seg = text[span[0]:span[1]]
+        self._report._get_bool_ids()                     # lazily loads the tokenizer (RADREWARD_MODEL_PATH)
+        tok = self._report._tokenizer
+        if tok is not None:
+            return len(tok.encode(seg, add_special_tokens=False))
+        return int(len(seg) / 3.2)                       # ~chars per token for this tokenizer on ASP text
+
+    def _asp_mult(self, n_tok: int) -> float:
+        if self._asp_pen_max <= 0 or n_tok <= 0:
+            return 1.0
+        excess = max(0.0, n_tok - self._asp_free) / self._asp_ramp
+        return 1.0 - self._asp_pen_max * min(1.0, excess)
 
     def _aggregate(self, scores: List[float]) -> float:
         if not scores:
@@ -1802,6 +1959,11 @@ class RadiologyRouter(ORM):
             res = self._sub[key](sub_completions, **sub_kwargs)
             for j, i in enumerate(idxs):
                 out[i] = res[j]
+                if subs_of[i] == ['cls_tokens']:                  # standalone cls_tokens: format enforcement
+                    notag = not has_cls_tag_tokens(completions[i])
+                    agg.setdefault('format/cls_tokens_notag', []).append(float(notag))
+                    if notag and self._notag_mult < 1.0:
+                        out[i] *= self._notag_mult
             _grab(key, self._sub[key])                            # whole-batch components for this route
 
         for i in compound:
@@ -1815,9 +1977,28 @@ class RadiologyRouter(ORM):
             for t in subs:
                 # task-keyed reference if present, else the shared reference
                 sub_ref = ref_obj.get(t) if isinstance(ref_obj, dict) and t in ref_obj else ref_obj
-                scores.append(self._score_one(segs.get(t, completions[i]), t, sub_ref, kwargs, i, n))
+                seg_text = segs.get(t, completions[i])
+                s = self._score_one(seg_text, t, sub_ref, kwargs, i, n)
+                if t == 'cls_tokens':                             # compound: penalise only the cls_tokens part
+                    notag = not has_cls_tag_tokens(seg_text)
+                    agg.setdefault('format/cls_tokens_notag', []).append(float(notag))
+                    if notag and self._notag_mult < 1.0:
+                        s *= self._notag_mult
+                scores.append(s)
                 _grab(t, self._sub[self._route(t)])               # this row's components, keyed by subtask
             out[i] = self._aggregate(scores)
+
+        # ASP length penalty on the whole rollout (hinge above FREE tokens), for the configured tasks.
+        if self._asp_pen_max > 0:
+            for i in range(n):
+                if not (set(subs_of[i]) & self._asp_pen_tasks):
+                    continue
+                n_tok = self._asp_tokens(completions[i])
+                mult = self._asp_mult(n_tok)
+                out[i] *= mult
+                agg.setdefault('format/asp_present', []).append(float(n_tok > 0))
+                agg.setdefault('format/asp_tokens', []).append(float(n_tok))
+                agg.setdefault('format/asp_pen_mult', []).append(mult)
 
         # per-task-string reward means + all sub-reward component means -> wandb (rank0, best-effort)
         for i, t in enumerate(tasks):

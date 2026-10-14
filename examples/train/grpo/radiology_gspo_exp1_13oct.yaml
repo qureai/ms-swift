@@ -1,0 +1,141 @@
+# Experiment-1 GSPO curriculum RL (13_oct) for the CXR structured-report reward.
+# 13_oct = 7_oct recipe (λ_max 6, precision_target 0.50, W_emb 0.20, 218-tag vocab + W_gt=0 recall fix) PLUS:
+#   (1) SUBTYPE PARTIAL CREDIT (RADREWARD_SUBTYPE_CREDIT=0.5 + RADREWARD_FAMILIES): a predicted tag in the
+#       same clinical family as a GT tag (e.g. nodules vs solitary_pulmonary_nodule) scores 0.5 instead of
+#       0 — lifts the measured-recall ceiling (7_oct plateaued at ~0.34 partly from exact-match penalizing
+#       near-miss granularity). Families curated clinically; pericardial!=pleural kept separate.
+#   (2) REDUCED KL beta 0.02->0.01 (below) — more room off the under-calling SFT prior.
+# ---- original 7_oct / 5_oct lineage note below ----
+# 7_oct = 5_oct recipe (KL=0.02, mixed_ds, 218-tag vocab + W_gt=0 recall fix) with MORE RECALL AUTHORITY:
+# 5_oct held recall ~0.35 through ckpt-600 then DRIFTED into under-calling (ckpt-1600: recall 0.223,
+# 40% abn-silent, 1.11 findings/study). Diagnosis: lambda_recall pinned at its 3.0 cap couldn't outweigh
+# precision+embedding+KL pull toward silence on hard studies. 7_oct reward-knob changes (in the sbatch):
+# LAMBDA_MAX 3.0->6.0, W_RECALL seed 1.0->2.0, PRECISION_TARGET 0.60->0.50, W_EMB 0.35->0.20. KL stays
+# 0.02 (beta=0 caused total collapse). Vocab + W_gt=0 dual-recall fix retained.
+#   tsh ssh janhavi.prabhu@qure5.internal.qure.ai \
+#     'cd /cache/fast_data_nas71/janhavi/data/rl_training && sbatch rl_exp1_24sep.sbatch'
+#
+# WHAT CHANGED vs radiology_gspo_curriculum.yaml:
+#   * reward_embedding_model -> 23_sep cross-axis checkpoint-900 (was 15_sep / 18_sep).
+#   * dataset -> exp1_{easy,medium,hard} (consolidated cls_json->report + cls_tokens->report,
+#     + standalone asp + kgraph; safety_score>=0.8; ~12% normals). Built by build_exp1_data.py.
+#   * constrained-RL reward terms (recall/precision constraints, weighted-Brier calibration,
+#     A_attr attribute agreement, beta*safety embedding reliability) are switched ON via the
+#     RADREWARD_* env vars in rl_exp1_24sep.sbatch -- backwards-compatible defaults keep them off.
+#
+# CURRICULUM (3_oct): MIXED, not staged. easy-first caused an under-calling collapse (see dataset note),
+# so difficulties are shuffled together into one dataset consumed in random order.
+
+# ---- model: SFT VLM checkpoint -----------------------------------------------------------------
+# Qwen3.5-2B stage6b (tool-calling) SFT, checkpoint-608. Plain 2D (no vision_3d_config), template
+# qwen3_5 native. The reward's boolean-token calibration reads THIS tokenizer (|<ASP>| etc.).
+model: /cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/vlm_ckpts/Qwen3.5-2B_stage6b_alltools/v0-20260906-173237/checkpoint-608
+torch_dtype: bfloat16
+tuner_type: full
+attn_impl: sdpa               # flash_attn not installed in swift_infer
+template: qwen3_5             # Qwen3.5 (v3, patch16)
+enable_thinking: false        # 14_oct: rollouts were generated in THINKING mode (swift default for qwen3_5 -> prompt ends "<think>\n"),
+                              # unlike eval/deployment ("<think>\n\n</think>\n\n"). In thinking mode SFT opens with ASP blocks /
+                              # <tool_call> loops; with the closed block ckpt-200 wrote 0% ASP / 0% tool calls.
+
+# ---- reward ------------------------------------------------------------------------------------
+rlhf_type: grpo
+external_plugins:
+  - examples/train/grpo/plugin/radiology_reward.py
+reward_funcs:
+  - radiology                 # task router: dispatches per-row on the `task` column
+# 23_sep cross-axis embedding encoder (checkpoint-900) used by the embedding sub-reward + A_attr:
+reward_embedding_model: /cache/fast_data_nas71/janhavi/vlm_ckpts/qwen3_4b_embedding/23_sep_qwen3_4b_cross_axis_v1/checkpoints/checkpoint-900
+scale_rewards: group          # sub-rewards are already in [0,1]; group-standardize advantages
+
+# ---- data: exp1 curriculum stages, consumed IN ORDER (do not shuffle) --------------------------
+# Each row carries safety_score (GT completeness) + n_present_tags. The reward scales the embedding
+# sub-reward by beta(n_present)*safety so complete GT trusts the embedding, sparse GT leans on the
+# verifiable terms (cls/FP, recall/precision, calibration, atoms).
+dataset:
+  # REORDERED + DOWNSAMPLED curriculum (build_exp1_downsampled.py). Full 28k-row epoch took ~10d at
+  # ~131s/step on L40S vs a 5d wall -> only ~47% covered and the standalone cls (which fix cls collapse)
+  # never reached. These _ds stages (a) MERGE each standalone-cls tier INTO its difficulty stage so it is
+  # no longer stranded at the end, and (b) DOWNSAMPLE each task to 35%/tier so a FULL epoch fits the wall
+  # (~10,482 rows -> ~2,620 steps -> ~4.0d L40S / ~1.7d 4xH100). kgraph kept whole (scarcest task).
+  # 3_oct ANTI-COLLAPSE: MIXED (shuffled) curriculum, NOT easy->medium->hard. The easy-first order
+  # front-loaded ~1388 steps of the sparse easy tier (37% normal, 1.67 findings), making under-calling
+  # reward-optimal -> the policy collapsed to "predict all-normal" (2_oct ckpt-1400: 58% all-normal)
+  # before ever reaching the abnormal-rich tiers. Mixing difficulties throughout keeps under-calling
+  # from ever being optimal. exp1_mixed_ds.parquet = shuffle(easy_ds + medium_ds + hard_ds).
+  - /cache/fast_data_nas71/janhavi/data/rl_training/exp1/exp1_mixed_ds.parquet
+dataset_shuffle: true         # mixed curriculum: difficulties balanced across the whole run
+split_dataset_ratio: 0.0
+max_length: 22528             # 13_oct: 8192->22528 for native-res images (IMAGE_MAX_TOKEN_NUM=8192 in sbatch; was 16384):
+                              # worst case 8192 image + ~100 prompt + 5120 completion = ~13.4k (22528 kept as headroom).
+
+# ---- GSPO core ---------------------------------------------------------------------------------
+importance_sampling_level: sequence
+log_rollout_offpolicy_metrics: true   # compute+attach rollout logprobs -> reward kwargs so the Brier calibration term can fire
+beta: 0.01                    # 13_oct: 0.02->0.01 REDUCE KL (user) — give the policy more room to move off
+                              # the under-calling SFT prior; 7_oct plateaued at recall ~0.34 partly b/c the
+                              # 0.02 leash pulled back toward SFT. NOT 0 (beta=0 caused total collapse).
+# 3_oct note: KL anchor to the SFT reference (was 0.0). Holds the policy near
+                              # SFT's healthy ~2.65-finding behaviour so it can't drift into the all-normal
+                              # collapse. Ref model (~4GB) fits the ~12-17GB L40S headroom at bs=2/2048.
+epsilon: 3e-4
+epsilon_high: 4e-4
+num_generations: 12          # 13_oct v3: 16->12 rollouts/prompt (speed; 48208 ran ~362 s/step)
+steps_per_generation: 12     # 13_oct v3: gen batch = pdbs 2 * world 4 * 12 = 96 = 8 prompts x 12 (must divide by num_generations)
+num_iterations: 1
+dynamic_sample: true
+max_resample_times: 3
+
+# ---- rollout backend (from-source vLLM 0.26.0+cu128 in swift_infer, colocate) ------------------
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.2   # L40S: small KV pool (4B embedder + zero2_offload resident)
+                                   # GPU (~8GB), so vLLM's sleep/wake KV re-map OOM'd at 0.5 on L40S 48GB
+vllm_enforce_eager: true
+vllm_max_model_len: 22528     # 13_oct: 8192->22528 = prompt (<=16384 img + ~100 txt) + max_completion_length 5120
+vllm_limit_mm_per_prompt: '{"image": 1}'
+sleep_level: 1
+max_completion_length: 5120   # 13_oct: 2048->5120. Measured SFT ckpt-608 cls generations (2k eval samples): ~75% emit only the
+                              # 'general' section (~1.85k tok) then stop; ~22% continue into lung_cancer and hit 2048 (full
+                              # 110-tag roll-call ~4.0k tok). cls_json+ontology ~= 1.85k + ~0.45k report ~= 2.3k for the majority.
+                              # 7_oct at 2048 clipped 15-40% of rollouts for the first ~80 steps (-> 0% by ~step 200), pushing
+                              # the policy into compact non-SFT formats. 3072 would cover the majority; 5120 also covers the
+                              # ~22% long tail (full roll-call + report).
+                              # (older note) # ASP (the ~4-6k-tok tail that forced 3072) is now a RESERVED standalone
+                              # task and dropped from the curriculum. Longest remaining real completion
+                              # is ~800 tok (kgraph) / ~650 (cls_json,ontology), so 2048 clears every
+                              # legitimate output with margin and only clips runaway repetition.
+temperature: 1.0
+top_p: 0.9
+top_k: 20
+# 13_oct v3: stop degenerate rollouts immediately instead of at max_completion_length. 48208 rollouts: 35% of bbox were
+# <tool_call> loops (stage6b tool-calling carry-over) and 31% of ontology opened an ASP block; none of these strings occur in
+# the RL data. Single-token stops become stop_token_ids (vLLM v1 ignores string stops); <|ASP|> is plain text (5 tok).
+stop_words: ["<tool_call>", "<tool_response>", "</tool_response>"]   # 14_oct: ASP stops dropped -- they turned SFT's ASP-opening cls_tokens answers into empty answers (no learning signal)
+
+# ---- optimization ------------------------------------------------------------------------------
+num_train_epochs: 1
+per_device_train_batch_size: 2   # back to 24_sep value: at 2048 (no ASP) this is proven to fit L40S;
+gradient_accumulation_steps: 6   # 13_oct v3: 8->6 so an optimizer step = 2*4*6 = 48 completions = 4 prompts x 12 (same 4 prompts/step,
+                                 # same 4308-step schedule) and each 96-rollout generation feeds exactly 2 optimizer steps (as before).
+                                 # unchanged (2*8 == 1*16 == 64); faster per step (fewer micro-steps).
+learning_rate: 1e-6
+warmup_ratio: 0.05
+deepspeed: zero2_offload   # zero2 + optimizer->CPU offload: frees GPU so 2B-train + 4B embedder + vLLM fit L40S
+gradient_checkpointing: true   # cut activation memory (2048-tok completions + vision tokens)
+# 13_oct v3: Liger. swift GRPO then computes the policy loss with LigerFusedLinearGRPOLoss on model.model(...).last_hidden_state
+# + lm_head.weight (no full-vocab logits); liger 0.8.0 also patches Qwen3.5 RMSNorm/SwiGLU. ref/old logps still use the normal
+# forward (labels=None -> Liger keeps logits). Under Liger the trainer logs only kl + clip_ratio (no entropy / rollout-correction metrics).
+use_liger_kernel: true
+
+# ---- logging / io ------------------------------------------------------------------------------
+output_dir: /mnt/scratch/janhavi/rl_ckpts/exp1_13oct   # CephFS scratch (shared across nodes, fast; avoids nas71)
+run_name: exp1_13oct_gspo_cxr
+save_steps: 200
+save_total_limit: 3
+logging_steps: 5
+log_completions: true
+report_to:
+  - tensorboard
+  - wandb
+dataloader_num_workers: 2     # 4->2: 36457 died of a DataLoader /dev/shm Bus error at step 310

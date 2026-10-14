@@ -1284,6 +1284,13 @@ class DataLoaderMixin:
             eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
             dataloader = self.get_sp_dataloader(eval_dataset, self.args.eval_batch_size)
         if dataloader is None:
-            with self._disable_group_by_length():
-                return super().get_eval_dataloader(eval_dataset=eval_dataset)
+            # Eval must see every sample (drop_last=False) so pooled metrics (e.g. cls AUROC) cover the whole set;
+            # override without disturbing training batching, which shares args.dataloader_drop_last.
+            _orig_drop_last = self.args.dataloader_drop_last
+            self.args.dataloader_drop_last = False
+            try:
+                with self._disable_group_by_length():
+                    return super().get_eval_dataloader(eval_dataset=eval_dataset)
+            finally:
+                self.args.dataloader_drop_last = _orig_drop_last
         return dataloader

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=qwen35_2b_cacreorder
 #SBATCH --partition=h100
-#SBATCH --reservation=vlm          # qrnd4
+#SBATCH --reservation=vlm          # resolves to the reservation's current node (qrnd3 as of 13-Oct; verify scontrol show reservation vlm)
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=850G
+#SBATCH --mem=950G
 #SBATCH --time=14-00:00:00
 #SBATCH --output=/cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/examples/train/liger/logs/%x-%j.out
 #SBATCH --error=/cache/fast_data_nas71/janhavi/VLM_qure/vlm/swift/examples/train/liger/logs/%x-%j.err
@@ -34,7 +34,10 @@ MODEL=Qwen/Qwen3.5-2B                         # base skeleton for --vision_3d_mo
 # a later checkpoint before launch; copy it out of the live run dir first (those rotate every 6 saves).
 WARM=/mnt/scratch/janhavi/vlm_ckpts/1_oct_qwen3_5_2b_ct_slowfast/v1-20261005-122323/checkpoint-4600
 # RESUME (not warm-start): continue step count + optimizer + scheduler + RNG from a 6_oct checkpoint.
-RESUME=/mnt/scratch/janhavi/vlm_ckpts/6_oct_qwen3_5_2b_ct_slowfast_cacreorder/v3-20261006-214945/checkpoint-100
+# 13-Oct: run 38967 FAILED at ~step 8670 (DataLoader worker SIGBUS = /dev/shm exhaustion; healthy for 6.5d
+# before). Resuming from the last good checkpoint-8600 (in the dead v4 dir; new run writes to a fresh v5, so
+# 8600 is not rotated). Mitigations: --mem 850->950G (shm headroom over the ~805G RSS) + dataloader workers 4->2.
+RESUME=/mnt/scratch/janhavi/vlm_ckpts/6_oct_qwen3_5_2b_ct_slowfast_cacreorder/v4-20261007-000200/checkpoint-8600
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export CT_DATASET_CHANNELS=1                 # tag each dataset with a `channel` (per-channel loss + presence/AUC gate)
@@ -57,13 +60,16 @@ mkdir -p "$OUTPUT_DIR"
 #     FULL: cls_json (complete), cls_plus_mini_report_multiturn, pe_multiturn, reordered cac.
 #     ~75% (via #N, counts from wc -l on 06-Oct): everything else.
 DATA=/cache/fast_data_nas71/janhavi/data/ct_final_data/train
+# 13-Oct: these 6 moved out of ct_final_data/train into ct_training_data/ (line counts verified identical).
+DATA30=/cache/fast_data_nas71/janhavi/data/ct_training_data/30_sep_training_data
+DATATR=/cache/fast_data_nas71/janhavi/data/ct_training_data/training
 DATASET_PATHS=(
-    "$DATA/30_sep_2026_vlm_ct_tag_extraction_complete_cls_json_training.json"              # full  (cls_json)
-    "$DATA/30_sep_2026_ct_tag_extraction_cls_tokens_training.json#180379"                  # 75% of 240506
-    "$DATA/30_sep_2026_ct_cls_plus_mini_report_combined_training.json#62304"               # 75% of 83073
-    "$DATA/30_sep_2026_ct_cls_plus_mini_report_multiturn_training.json"                    # full  (mini report multiturn)
-    "$DATA/13_Aug_2026_ct_mini_structured_report_training.json#225099"                     # 75% of 300133
-    "$DATA/04_Sep_2026_ct_knowledge_graph_training.json#142023"                            # 75% of 189365
+    "$DATA30/30_sep_2026_vlm_ct_tag_extraction_complete_cls_json_training.json"            # full  (cls_json)
+    "$DATA30/30_sep_2026_ct_tag_extraction_cls_tokens_training.json#180379"                # 75% of 240506
+    "$DATA30/30_sep_2026_ct_cls_plus_mini_report_combined_training.json#62304"             # 75% of 83073
+    "$DATA30/30_sep_2026_ct_cls_plus_mini_report_multiturn_training.json"                  # full  (mini report multiturn)
+    "$DATATR/13_Aug_2026_ct_mini_structured_report_training.json#225099"                   # 75% of 300133
+    "$DATATR/04_Sep_2026_ct_knowledge_graph_training.json#142023"                          # 75% of 189365
     "$DATA/cac_json_reordered_train_06oct2026.json"                                        # full  (REORDERED cac)
     "$DATA/nodule_fpr_combined_train_30sep2026.json#268518"                                # 75% of 358025
     "$DATA/pe_multiturn_train_29sep2026.json"                                              # full  (pe)
@@ -145,7 +151,7 @@ swift sft \
     --save_only_model false \
     --dataloader_num_workers 4 \
     --dataloader_persistent_workers true \
-    --dataloader_prefetch_factor 1 \
+    --dataloader_prefetch_factor 2 \
     --dataloader_pin_memory false \
     --dataset_num_proc 16 \
     --system 'You are a helpful medical assistant.' \

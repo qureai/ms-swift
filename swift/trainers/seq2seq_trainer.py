@@ -23,6 +23,11 @@ from .utils import per_token_loss_func, per_token_loss_func_sp
 
 logger = get_logger()
 
+# Oncology tags that aren't decidable from a single CT (need a prior study); excluded from macro_excl_prior.
+# Matched case-insensitively against the tag-name suffix, so both "oncology_assessment/progressive_disease"
+# and token-style "<PROGRESSIVE_DISEASE>" are caught.
+_CLS_PRIOR_DEPENDENT = ('progressive_disease', 'stable_disease', 'partial_response', 'complete_response')
+
 
 class _ViTWarmupFreezeCallback(TrainerCallback):
     """Freeze the pretrained 3D-encoder BLOCKS for the first `freeze_steps` steps, then unfreeze. Freezing at
@@ -268,33 +273,119 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
             la.append(g)
 
     def _cls_auc_compute_and_log(self, mode='eval'):
-        """At eval end: per-slot AUROC (skipping slots without both classes) -> macro + wandb `cls_macro_auc`."""
-        if not self._cls_auc_buf:
+        """At eval end: POOL per-slot P(true)+GT across ALL ranks, then compute the full AUROC panel on rank 0
+        (macro / macro_excl_prior / micro / prevalence-weighted + presence acc/nll + mean P(true)), per-tag
+        AUROC scalars, a W&B table and a per-step CSV. Pooling first is required: a mean of per-shard AUROCs is
+        NOT the pooled AUROC. Only rank 0 updates custom_metrics; MeanMetric.compute()'s all_reduce then carries
+        the scalars to every rank, and the key-sync in compute_custom_metrics auto-creates the new keys elsewhere.
+        This method runs on every rank (evaluate() calls it unconditionally), so the all_gather is collective-safe."""
+        import numpy as np
+
+        # ---- gather every rank's raw buffer, merge per slot -------------------------------------------------
+        local = self._cls_auc_buf
+        self._cls_auc_buf = {}
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            parts = [None] * dist.get_world_size()
+            dist.all_gather_object(parts, local)       # COLLECTIVE: all ranks reach this
+        else:
+            parts = [local]
+        if self.args.process_index != 0:
+            return
+        pooled = {}
+        for part in parts:
+            for s, (sc, la) in (part or {}).items():
+                p = pooled.setdefault(int(s), ([], []))
+                p[0].extend(sc)
+                p[1].extend(la)
+        if not pooled:
             return
         try:
             from sklearn.metrics import roc_auc_score
         except Exception:
-            self._cls_auc_buf = {}
             return
-        aucs, lines = [], []
-        for s in sorted(self._cls_auc_buf):
-            sc, la = self._cls_auc_buf[s]
-            if len(set(la)) < 2:                                     # AUROC needs both classes present
-                continue
-            try:
-                a = float(roc_auc_score(la, sc))
-            except Exception:
-                continue
-            aucs.append(a)
-            name = (self._cls_auc_tag_names[s] if self._cls_auc_tag_names and s < len(self._cls_auc_tag_names)
+
+        min_pos = int(getattr(self.args, 'eval_cls_auc_min_pos', 10) or 10)
+        step = int(getattr(self.state, 'global_step', 0))
+
+        def _name(s):
+            return (self._cls_auc_tag_names[s] if self._cls_auc_tag_names and s < len(self._cls_auc_tag_names)
                     else f'slot{s}')
-            lines.append(f'{name}={a:.3f}(n={len(la)})')
-        if aucs:
-            macro = sum(aucs) / len(aucs)
-            self.custom_metrics[mode]['cls_macro_auc'].update(torch.tensor(macro))
-            logger.info(f'cls_json per-tag AUC (macro={macro:.4f} over {len(aucs)} tags): '
-                        + ', '.join(lines[:40]))
-        self._cls_auc_buf = {}
+
+        def _is_prior(name):
+            n = name.lower().strip('<>')
+            return any(n.endswith(t) for t in _CLS_PRIOR_DEPENDENT)
+
+        # ---- per-slot AUROC + pooled pairs for micro / acc / nll -------------------------------------------
+        per_tag, rows = {}, []
+        all_p, all_g = [], []                          # every scored boolean (for micro / presence_acc / nll)
+        for s in sorted(pooled):
+            sc, la = pooled[s]
+            sc = np.asarray(sc, dtype=np.float64)
+            la = np.asarray(la, dtype=np.float64)
+            all_p.append(sc)
+            all_g.append(la)
+            n_pos = int(la.sum())
+            n_neg = int(la.size - n_pos)
+            name = _name(s)
+            if n_pos >= 1 and n_neg >= 1:
+                try:
+                    a = float(roc_auc_score(la, sc))
+                except Exception:
+                    continue
+                in_macro = n_pos >= min_pos
+                per_tag[name] = {'auc': a, 'n_pos': n_pos, 'n_neg': n_neg, 'in_macro': in_macro,
+                                 'prior': _is_prior(name)}
+                rows.append([step, name, a, n_pos, n_neg, in_macro])
+
+        macro_set = {t: d for t, d in per_tag.items() if d['in_macro']}
+        if not macro_set:
+            return
+        p_all = np.concatenate(all_p)
+        g_all = np.concatenate(all_g)
+        aucs = np.array([d['auc'] for d in macro_set.values()])
+        excl = [d['auc'] for d in macro_set.values() if not d['prior']]
+        wsum = sum(d['n_pos'] for d in macro_set.values())
+
+        panel = {
+            'cls_macro_auc': float(aucs.mean()),
+            'cls_macro_auc_excl_prior': float(np.mean(excl)) if excl else float('nan'),
+            'cls_micro_auc': float(roc_auc_score(g_all, p_all)) if (g_all.min() != g_all.max()) else float('nan'),
+            'cls_prevw_auc': float(sum(d['auc'] * d['n_pos'] for d in macro_set.values()) / wsum) if wsum else float('nan'),
+            'cls_presence_acc': float(((p_all >= 0.5) == (g_all == 1)).mean()),
+            'cls_presence_nll': float(-np.mean(np.where(g_all == 1, np.log(np.clip(p_all, 1e-7, 1.0)),
+                                                        np.log(np.clip(1.0 - p_all, 1e-7, 1.0))))),
+            'cls_mean_ptrue_pos': float(p_all[g_all == 1].mean()) if (g_all == 1).any() else float('nan'),
+            'cls_mean_ptrue_neg': float(p_all[g_all == 0].mean()) if (g_all == 0).any() else float('nan'),
+            'cls_n_tags_macro': float(len(macro_set)),
+        }
+        for k, v in panel.items():
+            if v == v:                                 # skip NaN
+                self.custom_metrics[mode][k].update(torch.tensor(float(v)))
+        for name, d in per_tag.items():                # per-tag AUROC scalars (every both-class tag)
+            self.custom_metrics[mode][f'cls_auc/{name}'].update(torch.tensor(d['auc']))
+
+        logger.info(f'cls_json AUROC [n_tags_macro={len(macro_set)}] macro={panel["cls_macro_auc"]:.4f} '
+                    f'micro={panel["cls_micro_auc"]:.4f} prevw={panel["cls_prevw_auc"]:.4f} '
+                    f'excl_prior={panel["cls_macro_auc_excl_prior"]:.4f} acc={panel["cls_presence_acc"]:.3f}')
+
+        # ---- W&B table + per-step CSV (rank 0, fail-safe) --------------------------------------------------
+        cols = ['step', 'tag', 'auc', 'n_pos', 'n_neg', 'in_macro']
+        try:
+            import wandb
+            if wandb.run is not None and rows:
+                wandb.run.log({f'{mode}/cls_per_tag_auc': wandb.Table(columns=cols, data=rows)}, commit=False)
+        except Exception as e:
+            logger.warning(f'cls_auc wandb table skipped ({type(e).__name__}: {e})')
+        try:
+            import csv
+            d = os.path.join(self.args.output_dir, 'cls_per_tag_auc')
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, f'step_{step:08d}.csv'), 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(cols)
+                w.writerows(sorted(rows, key=lambda r: r[1]))
+        except Exception as e:
+            logger.warning(f'cls_auc per-tag CSV skipped ({type(e).__name__}: {e})')
 
     def evaluate(self, *args, **kwargs):
         if self._cls_auc_enabled:

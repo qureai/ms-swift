@@ -32,6 +32,7 @@ _CHANNEL_RULES = [
     ('omnict_region_findings', 'omnict_qa'),                 # omnict region-findings Q&A
     ('omnict_abnormality', 'abn'),                           # abnormality grounding (omnict)
     ('report_comparison', 'rep_cmp'),                        # prior-vs-current report comparison
+    ('tool_calling', 'tool'),                                # implicit tool-calling report (12_oct)
 ]
 
 
